@@ -23,7 +23,7 @@ through the [`mysql-el`](https://github.com/hadleywang/mysql-el) dynamic module 
 ## Requirements
 
 - Emacs 29+ (with dynamic module support)
-- [`mysql-el`](https://github.com/hadleywang/mysql-el) — Emacs dynamic module wrapping libmysqlclient
+- [`mysql-el`](https://github.com/swida/mysql-el) — Emacs dynamic module wrapping libmysqlclient
 
 ## Installation
 
