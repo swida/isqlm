@@ -224,9 +224,27 @@ up to the current window width minus table borders."
     (condition-case err
         (require 'mysql-el)
       (error
-       (error "Cannot load mysql-el module: %s" (error-message-string err)))))
+       (error "Cannot load mysql-el module: %s" (isqlm--error-message err)))))
   (unless (mysql-available-p)
     (error "mysql-el module loaded but mysql-available-p returned nil")))
+
+;; ============================================================
+;; Error message extraction
+;; ============================================================
+
+(defun isqlm--error-message (err)
+  "Extract a human-readable error message from ERR.
+ERR is the value bound by `condition-case'.  mysql-el signals errors
+as (error . \"message-string\") where the cdr is a plain string rather
+than the usual (format-string . args) list, which causes
+`error-message-string' to return \"peculiar error\".  This function
+handles both formats."
+  (let ((data (cdr err)))
+    (cond
+     ((stringp data) data)
+     ((and (consp data) (stringp (car data)))
+      (apply #'format (car data) (cdr data)))
+     (t (error-message-string err)))))
 
 ;; ============================================================
 ;; Connection helpers
@@ -400,6 +418,81 @@ up to the current window width minus table borders."
      ((string-suffix-p ";" trimmed)
       (cons (string-trim-right (substring trimmed 0 -1)) nil))
      (t (cons trimmed nil)))))
+
+(defun isqlm--split-statements (sql)
+  "Split SQL into a list of individual statements.
+Each element is a complete statement including its terminator (`;' or `\\G').
+Handles quoted strings and comments to avoid splitting inside them."
+  (let ((len (length sql))
+        (i 0)
+        (start 0)
+        (statements nil)
+        (in-single-quote nil)
+        (in-double-quote nil)
+        (in-backtick nil)
+        (in-line-comment nil)
+        (in-block-comment nil))
+    (while (< i len)
+      (let ((ch (aref sql i)))
+        (cond
+         ;; Line comment ends at newline
+         (in-line-comment
+          (when (= ch ?\n)
+            (setq in-line-comment nil)))
+         ;; Block comment: check for */
+         (in-block-comment
+          (when (and (= ch ?*) (< (1+ i) len) (= (aref sql (1+ i)) ?/))
+            (setq in-block-comment nil)
+            (cl-incf i)))
+         ;; Inside single quote
+         (in-single-quote
+          (when (= ch ?')
+            (if (and (< (1+ i) len) (= (aref sql (1+ i)) ?'))
+                (cl-incf i)  ; escaped quote ''
+              (setq in-single-quote nil))))
+         ;; Inside double quote
+         (in-double-quote
+          (when (= ch ?\")
+            (setq in-double-quote nil)))
+         ;; Inside backtick
+         (in-backtick
+          (when (= ch ?`)
+            (setq in-backtick nil)))
+         ;; Normal context
+         (t
+          (cond
+           ((= ch ?') (setq in-single-quote t))
+           ((= ch ?\") (setq in-double-quote t))
+           ((= ch ?`) (setq in-backtick t))
+           ;; -- line comment
+           ((and (= ch ?-) (< (1+ i) len) (= (aref sql (1+ i)) ?-))
+            (setq in-line-comment t) (cl-incf i))
+           ;; # line comment
+           ((= ch ?#)
+            (setq in-line-comment t))
+           ;; /* block comment
+           ((and (= ch ?/) (< (1+ i) len) (= (aref sql (1+ i)) ?*))
+            (setq in-block-comment t) (cl-incf i))
+           ;; \G terminator
+           ((and (= ch ?\\) (< (1+ i) len)
+                 (memq (aref sql (1+ i)) '(?G ?g)))
+            (let ((stmt (string-trim (substring sql start (+ i 2)))))
+              (when (> (length stmt) 0)
+                (push stmt statements)))
+            (cl-incf i)
+            (setq start (1+ i)))
+           ;; ; terminator
+           ((= ch ?\;)
+            (let ((stmt (string-trim (substring sql start (1+ i)))))
+              (when (> (length stmt) 0)
+                (push stmt statements)))
+            (setq start (1+ i)))))))
+      (cl-incf i))
+    ;; Remainder (no terminator)
+    (let ((rest (string-trim (substring sql start))))
+      (when (> (length rest) 0)
+        (push rest statements)))
+    (nreverse statements)))
 
 ;; ============================================================
 ;; Result formatting
@@ -724,7 +817,7 @@ Usage:
                 (setq isqlm-pending-input ""))
             (error
              (isqlm--output-error
-              (format "*** Connection Error *** %s\n" (error-message-string err))))))
+              (format "*** Connection Error *** %s\n" (isqlm--error-message err))))))
       ;; Connect with explicit args or prompts
       (let* ((host     (or (nth 0 args) (read-string (format "Host (default %s): " isqlm-default-host) nil nil isqlm-default-host)))
              (user     (or (nth 1 args) (read-string (format "User (default %s): " isqlm-default-user) nil nil isqlm-default-user)))
@@ -750,7 +843,7 @@ Usage:
               (setq isqlm-pending-input ""))
           (error
            (isqlm--output-error
-            (format "*** Connection Error *** %s\n" (error-message-string err)))))))))
+            (format "*** Connection Error *** %s\n" (isqlm--error-message err)))))))))
 
 (defun isqlm/disconnect (&rest _args)
   "Disconnect from MySQL."
@@ -794,7 +887,7 @@ Usage:
             (isqlm--output-info (format "Database changed to: %s\n" db)))
         (error
          (isqlm--output-error
-          (format "*** Error *** %s\n" (error-message-string err)))))))))
+          (format "*** Error *** %s\n" (isqlm--error-message err)))))))))
 
 (defun isqlm/status (&rest _args)
   "Show connection status."
@@ -896,10 +989,30 @@ Return t if handled, nil if it should be treated as SQL."
 
 (defun isqlm-send-input ()
   "Read current input and execute it.
+If point is in the history area (before the current prompt), copy
+the current line to the input area and execute it — similar to
+Eshell and sql-mode behavior.
 If the input is a built-in command, dispatch it.
 If it is SQL and complete (ends with `;' or `\\G'), execute it.
 Otherwise, insert a continuation prompt for multi-line input."
   (interactive)
+  ;; If point is before the current input area, grab the line and
+  ;; copy it to the input area, then execute from there.
+  (when (< (point) (marker-position isqlm-last-output-end))
+    (let ((line (string-trim (buffer-substring-no-properties
+                              (line-beginning-position)
+                              (line-end-position)))))
+      ;; Strip any prompt prefix that may be on the line
+      (when (string-prefix-p isqlm-prompt-internal line)
+        (setq line (substring line (length isqlm-prompt-internal))))
+      (when (string-prefix-p isqlm-prompt-continue line)
+        (setq line (substring line (length isqlm-prompt-continue))))
+      (setq line (string-trim line))
+      (when (> (length line) 0)
+        ;; Replace current input with the grabbed line
+        (isqlm--replace-current-input line)
+        (goto-char (point-max)))))
+  ;; Now proceed with normal input handling
   (let ((isqlm-buf (current-buffer))
         (input (buffer-substring-no-properties
                 isqlm-last-output-end (point-max))))
@@ -941,17 +1054,19 @@ Otherwise, insert a continuation prompt for multi-line input."
         (setq isqlm-pending-input accumulated)
         (isqlm--emit-prompt))
 
-       ;; Complete SQL — execute
+       ;; Complete SQL — execute (possibly multiple statements)
        (t
         (isqlm--add-to-history accumulated)
         (setq isqlm-pending-input "")
-        (condition-case err
-            (let ((result (isqlm--execute-sql accumulated)))
-              (isqlm--output result))
-          (error
-           (when isqlm-noisy (ding))
-           (isqlm--output-error
-            (format "*** Error *** %s\n" (error-message-string err)))))
+        (let ((statements (isqlm--split-statements accumulated)))
+          (dolist (stmt statements)
+            (condition-case err
+                (let ((result (isqlm--execute-sql stmt)))
+                  (isqlm--output result))
+              (error
+               (when isqlm-noisy (ding))
+               (isqlm--output-error
+                (format "*** Error *** %s\n" (isqlm--error-message err)))))))
         (isqlm--emit-prompt))))))
 
 ;; ============================================================
@@ -1024,8 +1139,66 @@ Otherwise, insert a continuation prompt for multi-line input."
       (isqlm--output (isqlm--execute-sql sql))
     (error
      (isqlm--output-error
-      (format "*** Error *** %s\n" (error-message-string err)))))
+      (format "*** Error *** %s\n" (isqlm--error-message err)))))
   (isqlm--emit-prompt))
+
+;; ============================================================
+;; Send from external buffers (à la sql-send-string)
+;; ============================================================
+
+(defvar isqlm-buffer nil
+  "The ISQLM buffer to send SQL to.
+Set this to direct `isqlm-send-string', `isqlm-send-region', etc.
+to a specific ISQLM session.  Can also be set buffer-locally.")
+
+(defun isqlm--target-buffer ()
+  "Return the ISQLM buffer to send SQL to.
+Check `isqlm-buffer' (buffer-local), then fall back to any live
+`*isqlm*' buffer."
+  (or (and isqlm-buffer
+           (get-buffer isqlm-buffer)
+           (buffer-live-p (get-buffer isqlm-buffer))
+           (get-buffer isqlm-buffer))
+      (let ((buf (get-buffer "*isqlm*")))
+        (and buf (buffer-live-p buf) buf))
+      (user-error "No ISQLM buffer found.  Start one with M-x isqlm")))
+
+(defun isqlm-send-string (str)
+  "Send STR as SQL to the ISQLM process buffer and display the result.
+The target buffer is determined by `isqlm-buffer' or defaults to `*isqlm*'.
+If STR does not end with `;' or `\\G', a `;' is appended automatically."
+  (interactive "sSQL: ")
+  (let* ((s (string-trim str))
+         (buf (isqlm--target-buffer)))
+    (when (string= s "")
+      (user-error "Empty SQL string"))
+    ;; Auto-append terminator if missing
+    (unless (or (string-suffix-p ";" s)
+                (string-suffix-p "\\G" s))
+      (setq s (concat s ";")))
+    (with-current-buffer buf
+      (unless (isqlm--connected-p)
+        (user-error "ISQLM buffer %s is not connected" (buffer-name buf)))
+      (isqlm--quick-sql s))
+    ;; Display the ISQLM buffer
+    (display-buffer buf)))
+
+(defun isqlm-send-region (start end)
+  "Send the region between START and END to the ISQLM process buffer."
+  (interactive "r")
+  (isqlm-send-string (buffer-substring-no-properties start end)))
+
+(defun isqlm-send-paragraph ()
+  "Send the current paragraph to the ISQLM process buffer."
+  (interactive)
+  (let ((start (save-excursion (backward-paragraph) (point)))
+        (end   (save-excursion (forward-paragraph) (point))))
+    (isqlm-send-string (buffer-substring-no-properties start end))))
+
+(defun isqlm-send-buffer ()
+  "Send the entire buffer to the ISQLM process buffer."
+  (interactive)
+  (isqlm-send-string (buffer-substring-no-properties (point-min) (point-max))))
 
 ;; ============================================================
 ;; Major mode (eshell-style: derived from fundamental-mode)
@@ -1111,6 +1284,7 @@ Switches to buffer BUF-NAME (`*isqlm*' by default) or creates it."
       (setq buf (get-buffer-create buf-name))
       (with-current-buffer buf
         (isqlm-mode)))
+    (setq isqlm-buffer buf)
     (pop-to-buffer-same-window buf)))
 
 ;;;###autoload

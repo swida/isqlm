@@ -10,15 +10,19 @@ through the [`mysql-el`](https://github.com/hadleywang/mysql-el) dynamic module 
 - **Zero external processes** — no shell, no `mysql` CLI, no comint; pure Elisp + C module
 - **Built-in commands** prefixed with `\` (e.g. `\connect`, `\help`, `\style`)
 - **`sql-connection-alist` integration** — reuse Emacs's standard connection definitions
+- **Multi-statement execution** — `select 1; select 2;` executes each statement and shows all results
 - **Tabular result display** with ASCII or Unicode box-drawing borders
 - **Vertical display** — end SQL with `\G` for row-per-field output
 - **Multi-line SQL input** — press `M-RET` for literal newlines; `RET` submits
 - **Multi-line cell values** — newlines inside column values render correctly
+- **History re-execution** — move cursor to any previous input line and press `RET` to re-run it
 - **Input interrupt** — `C-c C-c` aborts current (multi-line) input
+- **Send SQL from external buffers** — `isqlm-send-region`, `isqlm-send-paragraph`, etc.
 - **Ring-based input history** with file persistence (`M-p` / `M-n`)
 - **SQL keyword font-locking**
 - **Auto-adaptive column widths** based on window size
 - **Command aliases** — extensible shorthand mappings (`\?` = `\help`, etc.)
+- **Improved error messages** — correctly extracts MySQL error details from `mysql-el`
 
 ## Requirements
 
@@ -149,7 +153,7 @@ All built-in commands are prefixed with `\`:
 
 | Key | Action |
 |-----|--------|
-| `RET` | Submit input |
+| `RET` | Submit input; or re-execute line under cursor (in history area) |
 | `M-RET` | Insert literal newline (multi-line SQL) |
 | `C-c C-c` | Abort current input (interrupt) |
 | `C-c C-n` | Connect |
@@ -206,6 +210,26 @@ Add aliases via `isqlm-command-aliases`:
 ```elisp
 (push '("t" . "tables") isqlm-command-aliases)
 ;; Now \t works as \tables
+```
+
+## Sending SQL from External Buffers
+
+Similar to `sql-send-string` in `sql.el`, you can send SQL from any buffer to an ISQLM session:
+
+| Command | Description |
+|---------|-------------|
+| `isqlm-send-string` | Send a SQL string (prompts in minibuffer) |
+| `isqlm-send-region` | Send the active region |
+| `isqlm-send-paragraph` | Send the current paragraph |
+| `isqlm-send-buffer` | Send the entire buffer |
+
+The target ISQLM buffer is determined by the global variable `isqlm-buffer`, which is automatically set when you open an ISQLM session. For multiple sessions, set it explicitly:
+
+```elisp
+(setq isqlm-buffer "*isqlm:mydb*")
+
+;; Or set buffer-locally in a SQL source file:
+;; -*- isqlm-buffer: "*isqlm:mydb*" -*-
 ```
 
 ## Architecture

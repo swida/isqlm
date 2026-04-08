@@ -69,10 +69,14 @@ Buffer layout:
 
 ## 3. Input Processing Flow
 
-`isqlm-send-input` is the sole input entry point (bound to `RET` and `C-c C-c`):
+`isqlm-send-input` is the sole input entry point (bound to `RET`):
 
 ```
 User presses RET
+  │
+  ├─ Point in history area (before current prompt)?
+  │     → Copy that line (strip prompt prefix) to current input area
+  │     → Fall through to normal handling below
   │
   ├─ Read text between last-output-end → point-max
   ├─ Mark that region as read-only (field=input)
@@ -85,12 +89,20 @@ User presses RET
   │
   ├─ SQL incomplete (no `;` or `\G`)? → set pending, emit continuation prompt "  -> "
   │
-  └─ SQL complete → isqlm--execute-sql → output result → emit-prompt
+  └─ SQL complete → split into statements → execute each → output results → emit-prompt
 ```
+
+### History Re-execution
+
+When the cursor is in the history area (before `isqlm-last-output-end`), pressing `RET` extracts the text of the current line, strips any prompt prefix (`SQL> ` or `  -> `), copies it to the current input area, and proceeds with normal execution. This mirrors Eshell and sql-mode behavior.
 
 ### Multi-line Input
 
 `M-RET` inserts a literal newline. When `RET` is pressed, the current line is appended to `isqlm-pending-input`. If the accumulated SQL does not end with `;` or `\G`, the continuation prompt `  -> ` is displayed.
+
+### Multi-statement Execution
+
+When the accumulated input contains multiple statements (e.g. `select 1; select 2;`), `isqlm--split-statements` splits them into individual statements. Each statement is executed separately via `isqlm--execute-sql`, and results are displayed sequentially. The splitter is quote-aware and comment-aware — it won't split on `;` inside strings, backtick identifiers, or comments.
 
 ## 4. Command Dispatch
 
@@ -114,6 +126,7 @@ Built-in commands are prefixed with `\` (following the MySQL client convention o
 |------------|----------|-------------|
 | `\help` | `isqlm/help` | Show help |
 | `\connect` | `isqlm/connect` | Connect (prompts for missing args) |
+| `\connections` | `isqlm/connections` | List `sql-connection-alist` entries |
 | `\disconnect` | `isqlm/disconnect` | Disconnect |
 | `\reconnect` | `isqlm/reconnect` | Reconnect with last params |
 | `\use` | `isqlm/use` | Switch database |
@@ -153,6 +166,20 @@ Add aliases via:
 | SELECT/SHOW/DESCRIBE/EXPLAIN | `mysql-select conn sql nil 'full` | Table or vertical formatting |
 | USE | `mysql-execute` | Update connection-info and mode-line |
 | Other (INSERT/UPDATE/DDL…) | `mysql-execute` | Display affected rows |
+
+### Multi-statement Splitting
+
+`isqlm--split-statements` parses the input character by character, tracking:
+- Single quotes, double quotes, backticks (to skip `;` inside identifiers/strings)
+- `--` and `#` line comments
+- `/* */` block comments
+- `\G` as an alternative statement terminator
+
+Each complete statement (including its terminator) is returned as a list element.
+
+### Error Message Extraction
+
+`mysql-el` signals errors via `env->non_local_exit_signal(env, 'error, "string")` where data is a plain string, not the usual `(format-string . args)` list. This causes Emacs's `error-message-string` to return `"peculiar error"`. The function `isqlm--error-message` handles this by checking if `(cdr err)` is a string and returning it directly.
 
 ### mysql-el API Summary
 
@@ -222,9 +249,9 @@ When a cell value contains `\n`, the table renderer splits it into multiple disp
 
 | Key | Command | Description |
 |-----|---------|-------------|
-| `RET` | `isqlm-send-input` | Submit input |
+| `RET` | `isqlm-send-input` | Submit input; or re-execute line under cursor |
 | `M-RET` | `newline` | Insert literal newline |
-| `C-c C-c` | `isqlm-send-input` | Submit input (alternative) |
+| `C-c C-c` | `isqlm-interrupt` | Abort current (multi-line) input |
 | `C-c C-q` | `isqlm-disconnect` | Disconnect |
 | `C-c C-r` | `isqlm-reconnect` | Reconnect |
 | `C-c C-n` | `isqlm-connect` | New connection |
@@ -269,8 +296,21 @@ All options belong to the `isqlm` customize group:
 ## 12. Entry Points
 
 - `M-x isqlm` — Create/switch to `*isqlm*` buffer
+- `M-x isqlm-sql-connect` — Select from `sql-connection-alist` with completion, open `*isqlm:NAME*`
 - `M-x isqlm-connect-and-run` — Start and immediately connect
-- `\connect HOST USER PASS DB PORT` at the prompt — Connect from within the buffer
+- `\connect NAME` at the prompt — Connect using a `sql-connection-alist` entry
+- `\connect HOST USER PASS DB PORT` at the prompt — Connect with explicit parameters
+
+## 12.1 Sending SQL from External Buffers
+
+| Function | Description |
+|----------|-------------|
+| `isqlm-send-string` | Send a SQL string to the ISQLM session |
+| `isqlm-send-region` | Send the active region |
+| `isqlm-send-paragraph` | Send the current paragraph |
+| `isqlm-send-buffer` | Send the entire buffer |
+
+The target buffer is determined by the global variable `isqlm-buffer`, automatically set when an ISQLM session is opened. For multiple sessions, set `isqlm-buffer` to the desired buffer name (e.g. `"*isqlm:mydb*"`).
 
 ## 13. Development Guide
 
@@ -307,3 +347,5 @@ No registration needed — `isqlm--try-builtin-command` auto-discovers `\`-prefi
 5. **Update `mode-line-process` after connection state changes** — call `force-mode-line-update`
 6. **`isqlm--history-save` must capture buffer-locals before `with-temp-file`** — the macro switches buffers
 7. **`\quit`/`\exit` kills the buffer** — `isqlm-send-input` checks `(buffer-live-p isqlm-buf)` afterward to avoid operating on a dead buffer
+8. **Multi-statement input is split by `isqlm--split-statements`** — it's quote/comment-aware; each statement is executed individually via `isqlm--execute-sql`
+9. **Use `isqlm--error-message` instead of `error-message-string`** — mysql-el signals errors with a plain string data, which `error-message-string` cannot parse
