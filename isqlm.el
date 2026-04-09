@@ -425,6 +425,98 @@ handles both formats."
       (cons (string-trim-right (substring trimmed 0 -1)) nil))
      (t (cons trimmed nil)))))
 
+(defun isqlm--expand-sql-variables (sql)
+  "Expand `:varname' references in SQL string to variable values.
+Skips expansion inside single-quoted strings, double-quoted strings,
+backtick identifiers, and comments.  Variable values are formatted as:
+  string → single-quoted (with internal quotes escaped)
+  number → literal
+  nil    → NULL
+  other  → single-quoted via `format'"
+  (let ((len (length sql))
+        (i 0)
+        (result nil)
+        (in-sq nil) (in-dq nil) (in-bt nil)
+        (in-lc nil) (in-bc nil))
+    (while (< i len)
+      (let ((ch (aref sql i)))
+        (cond
+         ;; Line comment
+         (in-lc
+          (push ch result)
+          (when (= ch ?\n) (setq in-lc nil)))
+         ;; Block comment
+         (in-bc
+          (push ch result)
+          (when (and (= ch ?*) (< (1+ i) len) (= (aref sql (1+ i)) ?/))
+            (push ?/ result)
+            (cl-incf i)
+            (setq in-bc nil)))
+         ;; Single quote
+         (in-sq
+          (push ch result)
+          (when (= ch ?')
+            (if (and (< (1+ i) len) (= (aref sql (1+ i)) ?'))
+                (progn (push ?' result) (cl-incf i))
+              (setq in-sq nil))))
+         ;; Double quote
+         (in-dq
+          (push ch result)
+          (when (= ch ?\") (setq in-dq nil)))
+         ;; Backtick
+         (in-bt
+          (push ch result)
+          (when (= ch ?`) (setq in-bt nil)))
+         ;; Normal context
+         (t
+          (cond
+           ((= ch ?') (setq in-sq t) (push ch result))
+           ((= ch ?\") (setq in-dq t) (push ch result))
+           ((= ch ?`) (setq in-bt t) (push ch result))
+           ((and (= ch ?-) (< (1+ i) len) (= (aref sql (1+ i)) ?-))
+            (setq in-lc t) (push ch result))
+           ((= ch ?#) (setq in-lc t) (push ch result))
+           ((and (= ch ?/) (< (1+ i) len) (= (aref sql (1+ i)) ?*))
+            (setq in-bc t) (push ch result) (push ?* result) (cl-incf i))
+           ;; :varname — expand if followed by word chars
+           ((and (= ch ?:)
+                 (< (1+ i) len)
+                 (let ((nc (aref sql (1+ i))))
+                   (or (and (>= nc ?a) (<= nc ?z))
+                       (and (>= nc ?A) (<= nc ?Z))
+                       (= nc ?_))))
+            (let ((start (1+ i))
+                  (j (1+ i)))
+              (while (and (< j len)
+                          (let ((c (aref sql j)))
+                            (or (and (>= c ?a) (<= c ?z))
+                                (and (>= c ?A) (<= c ?Z))
+                                (and (>= c ?0) (<= c ?9))
+                                (= c ?_) (= c ?-))))
+                (cl-incf j))
+              (let* ((name (substring sql start j))
+                     (sym (intern-soft name))
+                     (val (if (and sym (boundp sym))
+                              (symbol-value sym)
+                            (user-error "Void variable in SQL: :%s" name)))
+                     (replacement
+                      (cond
+                       ((null val) "NULL")
+                       ((integerp val) (number-to-string val))
+                       ((floatp val) (format "%g" val))
+                       ((stringp val)
+                        (concat "'" (replace-regexp-in-string "'" "''" val) "'"))
+                       (t (concat "'"
+                                  (replace-regexp-in-string
+                                   "'" "''" (format "%s" val))
+                                  "'")))))
+                (dolist (c (append replacement nil))
+                  (push c result))
+                (setq i (1- j)))))
+           (t (push ch result))))))
+      (cl-incf i))
+    (apply #'string (nreverse result))))
+
 (defun isqlm--split-statements (sql)
   "Split SQL into a list of individual statements.
 Each element is a complete statement including its terminator (`;' or `\\G').
@@ -1342,7 +1434,8 @@ Otherwise, insert a continuation prompt for multi-line input."
         (let ((statements (isqlm--split-statements accumulated)))
           (dolist (stmt statements)
             (condition-case err
-                (let ((result (isqlm--execute-sql stmt)))
+                (let* ((expanded (isqlm--expand-sql-variables stmt))
+                       (result (isqlm--execute-sql expanded)))
                   (isqlm--output result))
               (error
                (when isqlm-noisy (ding))

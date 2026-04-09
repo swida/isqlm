@@ -185,6 +185,21 @@ SQL> \message :user-login-name
 hadleywang
 ```
 
+Variables are also expanded in SQL statements (`:varname` syntax):
+
+```
+SQL> \setq cid 123
+SQL> SELECT * FROM customer WHERE customer_id = :cid;
+-- expands to: SELECT * FROM customer WHERE customer_id = 123;
+
+SQL> \setq name "O'Brien"
+SQL> SELECT * FROM users WHERE name = :name;
+-- expands to: SELECT * FROM users WHERE name = 'O''Brien';
+```
+
+Expansion rules: strings → `'quoted'`, numbers → literal, nil → `NULL`.
+Variables inside quotes and comments are not expanded.
+
 Use `\eval` to run arbitrary Elisp expressions (loops, conditionals, etc.):
 
 ```

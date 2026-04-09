@@ -146,6 +146,19 @@ This applies to both isqlm built-in commands and Elisp function calls. For isqlm
 
 Numeric strings are auto-coerced: `"42"` → `42`.
 
+### SQL Variable Expansion
+
+`:varname` references are also expanded inside SQL statements before execution, via `isqlm--expand-sql-variables`. The function scans the SQL character by character, tracking quote and comment context to avoid expanding inside strings, identifiers, or comments.
+
+| Variable type | Expansion |
+|--------------|-----------|
+| string | `'value'` (single-quoted, internal `'` escaped as `''`) |
+| integer | literal (e.g. `123`) |
+| float | literal (e.g. `3.14`) |
+| nil | `NULL` |
+
+This expansion happens after statement splitting and before `isqlm--execute-sql`.
+
 **Implemented commands:**
 
 | User input | Function | Description |
