@@ -736,10 +736,14 @@ Cells containing newlines are split across multiple display lines."
     "  \\help                                       — Show this help\n"
     "  \\quit / \\exit                               — Kill ISQLM buffer\n"
     "\n"
-    "Aliases: \\? = \\h = \\help, \\q = \\quit\n"
+    "Aliases: \\? = \\h = \\help, \\q = \\quit, \\u = \\use\n"
     "\n"
     "Or type any SQL statement ending with `;' or `\\G'.\n"
-    "Press M-RET for a literal newline (multi-line input).\n")))
+    "Press M-RET for a literal newline (multi-line input).\n"
+    "\n"
+    "\\CMD also works for Emacs Lisp functions, e.g. \\message hello\n"
+    "Use :varname to reference Emacs variables, e.g. \\message :user-login-name\n"
+    "Use \\setq to set variables, e.g. \\setq myvar \"hello world\"\n")))
 
 (defun isqlm--resolve-sql-connection (name)
   "Look up NAME in `sql-connection-alist'.
@@ -958,16 +962,62 @@ Returns symbol `killed' so the caller knows not to touch the buffer."
 (defvar isqlm-command-aliases
   '(("?" . "help")
     ("h" . "help")
-    ("q" . "quit"))
+    ("q" . "quit")
+    ("u" . "use"))
   "Alist mapping command aliases to canonical command names.
 E.g. \\? and \\h both map to \\help.")
+
+(defun isqlm--try-numeric (str)
+  "If STR looks like a number, return the number; otherwise return STR."
+  (if (string-match-p "\\`-?[0-9]+\\(?:\\.[0-9]*\\)?\\'" str)
+      (string-to-number str)
+    str))
+
+(defun isqlm--expand-arg (arg)
+  "Expand ARG: if it starts with `:' treat it as an Emacs variable reference.
+`:varname' → value of varname.  Otherwise return ARG as-is (with numeric coercion)."
+  (if (and (stringp arg) (string-prefix-p ":" arg) (> (length arg) 1))
+      (let ((sym (intern-soft (substring arg 1))))
+        (if (and sym (boundp sym))
+            (symbol-value sym)
+          (user-error "Void variable: %s" (substring arg 1))))
+    (isqlm--try-numeric arg)))
+
+(defun isqlm--parse-command-line (str)
+  "Parse STR into a list of tokens, respecting double-quoted strings.
+E.g. `\\message \"hello world\"' → (\"\\\\message\" \"hello world\")."
+  (let ((i 0) (len (length str)) tokens current)
+    (while (< i len)
+      (let ((ch (aref str i)))
+        (cond
+         ;; Whitespace outside quotes: flush current token
+         ((memq ch '(?\s ?\t))
+          (when current
+            (push (apply #'string (nreverse current)) tokens)
+            (setq current nil)))
+         ;; Double quote: read until closing quote
+         ((= ch ?\")
+          (cl-incf i)
+          (while (and (< i len) (/= (aref str i) ?\"))
+            (push (aref str i) current)
+            (cl-incf i)))
+         ;; Normal character
+         (t (push ch current))))
+      (cl-incf i))
+    (when current
+      (push (apply #'string (nreverse current)) tokens))
+    (nreverse tokens)))
 
 (defun isqlm--try-builtin-command (input)
   "Try to dispatch INPUT as a built-in command.
 Built-in commands start with `\\'.  E.g. `\\connect', `\\help'.
-Return t if handled, nil if it should be treated as SQL."
+Lookup order:
+  1. isqlm/CMD (built-in isqlm command)
+  2. CMD as an Emacs Lisp function (à la Eshell)
+Return t if handled, `killed' if the buffer was killed,
+nil if it should be treated as SQL."
   (let* ((trimmed (string-trim input))
-         (parts (split-string trimmed "[ \t]+" t))
+         (parts (isqlm--parse-command-line trimmed))
          (first (car parts)))
     (when (and first (string-prefix-p "\\" first) (> (length first) 1))
       ;; Skip \G — it's a SQL terminator, not a command
@@ -975,13 +1025,51 @@ Return t if handled, nil if it should be treated as SQL."
         (let* ((raw-cmd (downcase (substring first 1)))
                (cmd (or (cdr (assoc raw-cmd isqlm-command-aliases)) raw-cmd))
                (args (cdr parts))
-               (func (intern-soft (concat "isqlm/" cmd))))
-          (if (and func (fboundp func))
-              (let ((ret (apply func args)))
-                (if (eq ret 'killed) 'killed t))
+               (isqlm-func (intern-soft (concat "isqlm/" cmd)))
+               (elisp-func (intern-soft cmd)))
+          (cond
+           ;; 1. isqlm built-in command
+           ((and isqlm-func (fboundp isqlm-func))
+            (let* ((expanded-args (mapcar #'isqlm--expand-arg args))
+                   ;; isqlm commands expect string args, convert back
+                   (str-args (mapcar (lambda (a)
+                                       (if (stringp a) a (format "%s" a)))
+                                     expanded-args))
+                   (ret (apply isqlm-func str-args)))
+              (if (eq ret 'killed) 'killed t)))
+           ;; 2. Emacs Lisp function (interactive or not)
+           ((and elisp-func (fboundp elisp-func))
+            (condition-case err
+                (let* ((expanded-args
+                        (if (eq elisp-func 'setq)
+                            ;; setq is a special form; use `set' instead
+                            (if (< (length args) 2)
+                                (user-error "Usage: \\setq VARIABLE VALUE")
+                              (let ((val (isqlm--expand-arg (nth 1 args))))
+                                (set (intern (car args)) val)
+                                (when val
+                                  (isqlm--output
+                                   (concat (if (stringp val) val (pp-to-string val))
+                                           "\n")))
+                                nil))  ; nil so the outer `when result' is skipped
+                          (mapcar #'isqlm--expand-arg args)))
+                       (result (and expanded-args
+                                    (apply elisp-func expanded-args))))
+                  (when result
+                    (isqlm--output
+                     (concat (if (stringp result)
+                                 result
+                               (pp-to-string result))
+                             "\n"))))
+              (error
+               (isqlm--output-error
+                (format "*** Lisp Error *** %s\n" (isqlm--error-message err)))))
+            t)
+           ;; 3. Unknown
+           (t
             (isqlm--output-error
              (format "Unknown command: %s.  Type \\help for help.\n" first))
-            t))))))
+            t)))))))
 
 ;; ============================================================
 ;; Input handling (eshell-style: read from buffer, no process)

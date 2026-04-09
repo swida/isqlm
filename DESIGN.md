@@ -108,17 +108,42 @@ When the accumulated input contains multiple statements (e.g. `select 1; select 
 
 Built-in commands are prefixed with `\` (following the MySQL client convention of `\G`, `\q`, etc.) and implemented as `isqlm/NAME` functions. When the user types `\connect`, the dispatcher strips the `\` prefix and looks up `isqlm/connect`.
 
+**Lookup order** (`isqlm--try-builtin-command`):
+
+1. **Alias resolution**: check `isqlm-command-aliases` (e.g. `"?"` → `"help"`)
+2. **isqlm/CMD**: look up `(intern-soft "isqlm/CMD")` — built-in command
+3. **Emacs Lisp function**: look up `(intern-soft "CMD")` — if `fboundp`, call it with args
+4. **Unknown**: output error message
+
 ```elisp
-;; Dispatch logic (isqlm--try-builtin-command)
-;; User input: "\help arg1 arg2"
-;; → first = "\\help", raw-cmd = "help"
-;; → Check isqlm-command-aliases for alias resolution
-;; → (intern-soft "isqlm/help") → call (isqlm/help "arg1" "arg2")
+;; User input: "\message \"hello world\""
+;; → cmd = "message", args = ("hello world")
+;; → isqlm/message not found
+;; → (fboundp 'message) → t
+;; → (apply #'message expanded-args)
 ```
 
-**Special case**: `\G` is NOT treated as a command — it is the SQL vertical display terminator.
+**Special cases**:
+- `\G` is NOT treated as a command — it is the SQL vertical display terminator
+- `\setq` is a special form, so it's handled via `set` internally
 
-**Command aliases**: The `isqlm-command-aliases` alist maps shorthand names to canonical names (e.g. `"?"` → `"help"`, `"h"` → `"help"`, `"q"` → `"quit"`). Aliases are resolved before function lookup, allowing names that aren't valid Elisp identifiers.
+**Command aliases**: The `isqlm-command-aliases` alist maps shorthand names to canonical names. Aliases are resolved before function lookup, allowing names that aren't valid Elisp identifiers.
+
+### Argument Parsing
+
+`isqlm--parse-command-line` splits the input into tokens respecting double-quoted strings. E.g. `\message "hello world"` → `("\\message" "hello world")`.
+
+### Variable References
+
+Arguments prefixed with `:` are expanded to the value of the corresponding Emacs variable via `isqlm--expand-arg`:
+
+```
+:user-login-name  →  (symbol-value 'user-login-name)  →  "hadleywang"
+```
+
+This applies to both isqlm built-in commands and Elisp function calls. For isqlm commands, expanded values are converted back to strings. For Elisp calls, native types are preserved.
+
+Numeric strings are auto-coerced: `"42"` → `42`.
 
 **Implemented commands:**
 
@@ -136,9 +161,9 @@ Built-in commands are prefixed with `\` (following the MySQL client convention o
 | `\history` | `isqlm/history` | Show history |
 | `\quit`/`\exit` | `isqlm/quit` `isqlm/exit` | Quit |
 
-Aliases: `\?` = `\h` = `\help`, `\q` = `\quit`
+Aliases: `\?` = `\h` = `\help`, `\q` = `\quit`, `\u` = `\use`
 
-Unknown `\` commands produce an error message.
+Unknown `\` commands that are not Emacs Lisp functions produce an error message.
 
 ### Extending with New Commands
 

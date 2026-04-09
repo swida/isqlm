@@ -22,6 +22,8 @@ through the [`mysql-el`](https://github.com/hadleywang/mysql-el) dynamic module 
 - **SQL keyword font-locking**
 - **Auto-adaptive column widths** based on window size
 - **Command aliases** — extensible shorthand mappings (`\?` = `\help`, etc.)
+- **Elisp function dispatch** — `\CMD` falls back to Emacs Lisp functions (à la Eshell)
+- **Variable references** — use `:varname` in command args to reference Emacs variables
 - **Improved error messages** — correctly extracts MySQL error details from `mysql-el`
 
 ## Requirements
@@ -147,7 +149,33 @@ All built-in commands are prefixed with `\`:
 | `\help` | Show help |
 | `\quit` / `\exit` | Disconnect and kill buffer |
 
-**Aliases:** `\?` = `\h` = `\help`, `\q` = `\quit`
+**Aliases:** `\?` = `\h` = `\help`, `\q` = `\quit`, `\u` = `\use`
+
+### Elisp Functions & Variables
+
+Any `\CMD` that isn't a built-in isqlm command is looked up as an Emacs Lisp function:
+
+```
+SQL> \message "hello world"
+hello world
+SQL> \buffer-name
+*isqlm*
+SQL> \+ 1 2
+3
+SQL> \emacs-version
+29.1
+```
+
+Use `:varname` to reference Emacs variables in command arguments:
+
+```
+SQL> \setq mydb "testdb"
+testdb
+SQL> \u :mydb
+Database changed to: testdb
+SQL> \message :user-login-name
+hadleywang
+```
 
 ## Key Bindings
 
