@@ -126,6 +126,7 @@ Built-in commands are prefixed with `\` (following the MySQL client convention o
 **Special cases**:
 - `\G` is NOT treated as a command — it is the SQL vertical display terminator
 - `\setq` is a special form, so it's handled via `set` internally
+- `\eval` receives the raw rest of the input line (not tokenized), so Elisp expressions with parentheses and quotes are preserved intact
 
 **Command aliases**: The `isqlm-command-aliases` alist maps shorthand names to canonical names. Aliases are resolved before function lookup, allowing names that aren't valid Elisp identifiers.
 
@@ -157,6 +158,7 @@ Numeric strings are auto-coerced: `"42"` → `42`.
 | `\use` | `isqlm/use` | Switch database |
 | `\status` | `isqlm/status` | Show connection status |
 | `\style` | `isqlm/style` | Toggle/set table border style |
+| `\eval` | `isqlm/eval` | Evaluate arbitrary Elisp expression |
 | `\clear` | `isqlm/clear` | Clear buffer |
 | `\history` | `isqlm/history` | Show history |
 | `\quit`/`\exit` | `isqlm/quit` `isqlm/exit` | Quit |

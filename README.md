@@ -144,6 +144,7 @@ All built-in commands are prefixed with `\`:
 | `\use DATABASE` | Switch database |
 | `\status` | Show connection status |
 | `\style [ascii\|unicode]` | Toggle or set table border style |
+| `\eval EXPRESSION` | Evaluate an Elisp expression |
 | `\clear` | Clear buffer |
 | `\history` | Show input history |
 | `\help` | Show help |
@@ -175,6 +176,16 @@ SQL> \u :mydb
 Database changed to: testdb
 SQL> \message :user-login-name
 hadleywang
+```
+
+Use `\eval` to run arbitrary Elisp expressions (loops, conditionals, etc.):
+
+```
+SQL> \eval (+ 1 2 3)
+6
+SQL> \eval (dotimes (i 3) (isqlm--quick-sql (format "SELECT %d;" (1+ i))))
+SQL> \eval (if (isqlm--connected-p) "connected" "disconnected")
+connected
 ```
 
 ## Key Bindings

@@ -743,7 +743,8 @@ Cells containing newlines are split across multiple display lines."
     "\n"
     "\\CMD also works for Emacs Lisp functions, e.g. \\message hello\n"
     "Use :varname to reference Emacs variables, e.g. \\message :user-login-name\n"
-    "Use \\setq to set variables, e.g. \\setq myvar \"hello world\"\n")))
+    "Use \\setq to set variables, e.g. \\setq myvar \"hello world\"\n"
+    "Use \\eval to run Elisp, e.g. \\eval (+ 1 2)\n")))
 
 (defun isqlm--resolve-sql-connection (name)
   "Look up NAME in `sql-connection-alist'.
@@ -919,6 +920,25 @@ Without argument, toggle between ascii and unicode."
      (t
       (isqlm--output-error "Usage: \\style [ascii|unicode]\n")))))
 
+(defun isqlm/eval (&rest args)
+  "Evaluate an Elisp expression.  ARGS are joined and read as a sexp.
+Examples:
+  \\eval (+ 1 2)
+  \\eval (dotimes (i 3) (isqlm--quick-sql (format \"SELECT %d;\" (1+ i))))
+  \\eval (format \"hello %s\" user-login-name)"
+  (if (not args)
+      (isqlm--output-error "Usage: \\eval EXPRESSION\n")
+    (let ((expr-str (string-join args " ")))
+      (condition-case err
+          (let ((result (eval (read expr-str) t)))
+            (when result
+              (isqlm--output
+               (concat (if (stringp result) result (pp-to-string result))
+                       "\n"))))
+        (error
+         (isqlm--output-error
+          (format "*** Eval Error *** %s\n" (isqlm--error-message err))))))))
+
 (defun isqlm/clear (&rest _args)
   "Clear the ISQLM buffer."
   (let ((inhibit-read-only t))
@@ -1024,7 +1044,12 @@ nil if it should be treated as SQL."
       (unless (string= (upcase first) "\\G")
         (let* ((raw-cmd (downcase (substring first 1)))
                (cmd (or (cdr (assoc raw-cmd isqlm-command-aliases)) raw-cmd))
-               (args (cdr parts))
+               ;; For \eval, pass the raw rest of the line (not tokenized)
+               (args (if (string= cmd "eval")
+                         (let ((rest (string-trim
+                                      (substring trimmed (length first)))))
+                           (and (> (length rest) 0) (list rest)))
+                       (cdr parts)))
                (isqlm-func (intern-soft (concat "isqlm/" cmd)))
                (elisp-func (intern-soft cmd)))
           (cond
