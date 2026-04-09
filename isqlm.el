@@ -149,6 +149,12 @@ up to the current window width minus table borders."
 (defvar-local isqlm-history-ring nil)
 (defvar-local isqlm-history-index nil)
 (defvar-local isqlm-input-saved nil)
+(defvar-local isqlm-cond-stack nil
+  "Stack for \\if/\\elif/\\else/\\endif conditional flow.
+Each element is a plist (:satisfied BOOL :active BOOL :depth-skip INT).
+:satisfied — whether any branch in this \\if chain has been true.
+:active    — whether the current branch should execute.
+:depth-skip — nested \\if depth to skip when inactive (0 when active).")
 
 ;; ============================================================
 ;; Font-lock
@@ -733,6 +739,11 @@ Cells containing newlines are split across multiple display lines."
     "  \\style [ascii|unicode]                       — Toggle/set table style\n"
     "  \\clear                                      — Clear buffer\n"
     "  \\history                                    — Show input history\n"
+    "  \\echo TEXT...                                — Output text\n"
+    "  \\if CONDITION                                — Begin conditional block\n"
+    "  \\elif CONDITION                              — Else-if branch\n"
+    "  \\else                                        — Else branch\n"
+    "  \\endif                                       — End conditional block\n"
     "  \\help                                       — Show this help\n"
     "  \\quit / \\exit                               — Kill ISQLM buffer\n"
     "\n"
@@ -976,6 +987,150 @@ Returns symbol `killed' so the caller knows not to touch the buffer."
   'killed)
 
 ;; ============================================================
+;; Conditional flow (\if / \elif / \else / \endif)
+;; ============================================================
+
+(defun isqlm--cond-active-p ()
+  "Return non-nil if the current conditional context is active.
+When `isqlm-cond-stack' is empty, always active."
+  (or (null isqlm-cond-stack)
+      (plist-get (car isqlm-cond-stack) :active)))
+
+(defun isqlm--cond-falsy-value-p (v)
+  "Return non-nil if V is a \"falsy\" value for conditional checks.
+Falsy: nil, 0, empty string, or strings \"0\"/\"false\"/\"no\"/\"nil\"/\"off\"."
+  (or (null v)
+      (eq v 0)
+      (equal v 0.0)
+      (and (stringp v)
+           (member (downcase v) '("" "0" "false" "no" "nil" "off")))))
+
+(defun isqlm--cond-truthy-p (val)
+  "Return non-nil if VAL is \"truthy\" for \\if/\\elif conditions.
+VAL is a string from the command line.  Supported forms:
+  :varname     — look up Emacs variable, check its value
+  (elisp-expr) — evaluate, check result
+  literal      — check against falsy list"
+  (cond
+   ((null val) nil)
+   ((string= val "") nil)
+   ;; Elisp expression
+   ((string-prefix-p "(" val)
+    (condition-case nil
+        (not (isqlm--cond-falsy-value-p (eval (read val) t)))
+      (error nil)))
+   ;; Variable reference with :
+   ((string-prefix-p ":" val)
+    (let ((sym (intern-soft (substring val 1))))
+      (and sym (boundp sym)
+           (not (isqlm--cond-falsy-value-p (symbol-value sym))))))
+   ;; Literal false values
+   ((member (downcase val) '("0" "false" "no" "nil" "off")) nil)
+   ;; Everything else is truthy
+   (t t)))
+
+(defun isqlm/if (&rest args)
+  "Begin a conditional block.  ARGS: CONDITION.
+CONDITION can be:
+  - :varname     — true if variable is bound and non-nil
+  - (elisp-expr) — true if expression evaluates to non-nil
+  - literal      — true unless \"0\", \"false\", \"no\", \"nil\", \"\""
+  (let* ((condition (string-join args " "))
+         (result (isqlm--cond-truthy-p condition)))
+    (push (list :satisfied result :active result) isqlm-cond-stack)))
+
+(defun isqlm/elif (&rest args)
+  "Add an elif branch to current \\if block.  ARGS: CONDITION."
+  (if (not isqlm-cond-stack)
+      (isqlm--output-error "\\elif without \\if\n")
+    (let* ((frame (car isqlm-cond-stack))
+           (already-satisfied (plist-get frame :satisfied))
+           (condition (string-join args " "))
+           (result (and (not already-satisfied)
+                        (isqlm--cond-truthy-p condition))))
+      (setcar isqlm-cond-stack
+              (list :satisfied (or already-satisfied result)
+                    :active result)))))
+
+(defun isqlm/else (&rest _args)
+  "Add an else branch to current \\if block."
+  (if (not isqlm-cond-stack)
+      (isqlm--output-error "\\else without \\if\n")
+    (let* ((frame (car isqlm-cond-stack))
+           (already-satisfied (plist-get frame :satisfied)))
+      (setcar isqlm-cond-stack
+              (list :satisfied t
+                    :active (not already-satisfied))))))
+
+(defun isqlm/endif (&rest _args)
+  "End a conditional block."
+  (if isqlm-cond-stack
+      (pop isqlm-cond-stack)
+    (isqlm--output-error "\\endif without \\if\n")))
+
+(defun isqlm/echo (&rest args)
+  "Output ARGS as text.  Supports :varname expansion."
+  (let ((parts (mapcar (lambda (a)
+                         (let ((expanded (isqlm--expand-arg a)))
+                           (if (stringp expanded)
+                               expanded
+                             (format "%s" expanded))))
+                       args)))
+    (isqlm--output (concat (string-join parts " ") "\n"))))
+
+(defconst isqlm--cond-flow-commands '("if" "elif" "else" "endif")
+  "List of conditional flow command names.")
+
+(defun isqlm--cond-flow-command-p (input)
+  "Return non-nil if INPUT is a conditional flow command."
+  (let* ((trimmed (string-trim input))
+         (parts (split-string trimmed "[ \t]+" t))
+         (first (car parts)))
+    (and first
+         (string-prefix-p "\\" first)
+         (> (length first) 1)
+         (member (downcase (substring first 1)) isqlm--cond-flow-commands))))
+
+(defun isqlm--process-cond-flow (input)
+  "Process a conditional flow command in INPUT.
+Dispatches to isqlm/if, isqlm/elif, isqlm/else, or isqlm/endif.
+When in an inactive branch, only \\if (to track nesting) and
+\\endif/\\elif/\\else (to manage the stack) are fully processed."
+  (let* ((trimmed (string-trim input))
+         (parts (isqlm--parse-command-line trimmed))
+         (first (car parts))
+         (cmd (downcase (substring first 1)))
+         (args (cdr parts)))
+    (cond
+     ;; \if — always push a new frame; if parent is inactive, push inactive
+     ((string= cmd "if")
+      (if (isqlm--cond-active-p)
+          (isqlm/if (string-join args " "))
+        ;; Nested \if in inactive branch: push unconditionally inactive frame
+        (push (list :satisfied t :active nil) isqlm-cond-stack)))
+     ;; \elif — only evaluate if in an active parent context
+     ((string= cmd "elif")
+      (when isqlm-cond-stack
+        ;; Check if the *parent* (one level up) is active
+        (let ((parent-active (or (null (cdr isqlm-cond-stack))
+                                 (plist-get (cadr isqlm-cond-stack) :active))))
+          (if parent-active
+              (apply #'isqlm/elif args)
+            ;; In inactive parent: keep current frame inactive
+            nil))))
+     ;; \else — same logic as \elif
+     ((string= cmd "else")
+      (when isqlm-cond-stack
+        (let ((parent-active (or (null (cdr isqlm-cond-stack))
+                                 (plist-get (cadr isqlm-cond-stack) :active))))
+          (if parent-active
+              (isqlm/else)
+            nil))))
+     ;; \endif — always pop
+     ((string= cmd "endif")
+      (isqlm/endif)))))
+
+;; ============================================================
 ;; Command dispatch (eshell-style)
 ;; ============================================================
 
@@ -1151,6 +1306,19 @@ Otherwise, insert a continuation prompt for multi-line input."
       (cond
        ;; Empty input
        ((string= (string-trim accumulated) "")
+        (setq isqlm-pending-input "")
+        (isqlm--emit-prompt))
+
+       ;; Conditional flow commands — always processed, even in inactive branches
+       ((and (string= isqlm-pending-input "")
+             (isqlm--cond-flow-command-p accumulated))
+        (isqlm--process-cond-flow accumulated)
+        (isqlm--add-to-history accumulated)
+        (setq isqlm-pending-input "")
+        (isqlm--emit-prompt))
+
+       ;; In inactive conditional branch — skip everything else
+       ((not (isqlm--cond-active-p))
         (setq isqlm-pending-input "")
         (isqlm--emit-prompt))
 

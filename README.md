@@ -13,6 +13,7 @@ through the [`mysql-el`](https://github.com/hadleywang/mysql-el) dynamic module 
 - **Multi-statement execution** — `select 1; select 2;` executes each statement and shows all results
 - **Tabular result display** with ASCII or Unicode box-drawing borders
 - **Vertical display** — end SQL with `\G` for row-per-field output
+- **Conditional flow** — `\if`/`\elif`/`\else`/`\endif` with nesting support
 - **Multi-line SQL input** — press `M-RET` for literal newlines; `RET` submits
 - **Multi-line cell values** — newlines inside column values render correctly
 - **History re-execution** — move cursor to any previous input line and press `RET` to re-run it
@@ -147,6 +148,12 @@ All built-in commands are prefixed with `\`:
 | `\eval EXPRESSION` | Evaluate an Elisp expression |
 | `\clear` | Clear buffer |
 | `\history` | Show input history |
+| `\echo TEXT...` | Output text (supports `:varname` expansion) |
+| `\if CONDITION` | Begin conditional block |
+| `\elif CONDITION` | Else-if branch |
+| `\else` | Else branch |
+| `\endif` | End conditional block |
+| `\eval EXPRESSION` | Evaluate Elisp expression |
 | `\help` | Show help |
 | `\quit` / `\exit` | Disconnect and kill buffer |
 
@@ -187,6 +194,27 @@ SQL> \eval (dotimes (i 3) (isqlm--quick-sql (format "SELECT %d;" (1+ i))))
 SQL> \eval (if (isqlm--connected-p) "connected" "disconnected")
 connected
 ```
+
+### Conditional Flow
+
+Inspired by PostgreSQL's `psql`, supports `\if`/`\elif`/`\else`/`\endif` with nesting:
+
+```
+SQL> \setq is_customer true
+SQL> \if :is_customer
+SQL>     SELECT * FROM customer WHERE customer_id = 123;
+SQL> \elif :is_employee
+SQL>     \echo 'is an employee'
+SQL>     SELECT * FROM employee WHERE employee_id = 456;
+SQL> \else
+SQL>     \echo 'unknown role'
+SQL> \endif
+```
+
+Conditions can be:
+- `:varname` — true if the Emacs variable is bound and non-nil
+- `(elisp-expr)` — true if the expression evaluates to non-nil
+- Literal — true unless `"0"`, `"false"`, `"no"`, `"nil"`, or empty
 
 ## Key Bindings
 

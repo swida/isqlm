@@ -159,6 +159,11 @@ Numeric strings are auto-coerced: `"42"` → `42`.
 | `\status` | `isqlm/status` | Show connection status |
 | `\style` | `isqlm/style` | Toggle/set table border style |
 | `\eval` | `isqlm/eval` | Evaluate arbitrary Elisp expression |
+| `\echo` | `isqlm/echo` | Output text with variable expansion |
+| `\if` | `isqlm/if` | Begin conditional block |
+| `\elif` | `isqlm/elif` | Else-if branch |
+| `\else` | `isqlm/else` | Else branch |
+| `\endif` | `isqlm/endif` | End conditional block |
 | `\clear` | `isqlm/clear` | Clear buffer |
 | `\history` | `isqlm/history` | Show history |
 | `\quit`/`\exit` | `isqlm/quit` `isqlm/exit` | Quit |
@@ -183,6 +188,26 @@ Add aliases via:
 ```elisp
 (push '("t" . "tables") isqlm-command-aliases)
 ```
+
+## 4.1 Conditional Flow (`\if`/`\elif`/`\else`/`\endif`)
+
+Inspired by PostgreSQL's `psql` meta-commands. Uses a stack-based approach:
+
+**State**: `isqlm-cond-stack` — a stack of plists, each with:
+- `:satisfied` — whether any branch in this `\if` chain has been true
+- `:active` — whether the current branch should execute
+
+**Processing order** in `isqlm-send-input`:
+1. Conditional flow commands (`\if`/`\elif`/`\else`/`\endif`) are **always** processed, even in inactive branches (to track nesting depth)
+2. All other input is skipped when `(isqlm--cond-active-p)` returns nil
+
+**Nesting**: When a `\if` is encountered inside an inactive branch, an unconditionally inactive frame `(:satisfied t :active nil)` is pushed. `\elif`/`\else` only evaluate conditions when the parent frame is active.
+
+**Condition evaluation** (`isqlm--cond-truthy-p`):
+- `:varname` — true if the Emacs variable is bound and non-nil
+- `(elisp-expr)` — true if the expression evaluates to non-nil
+- Falsy literals: `"0"`, `"false"`, `"no"`, `"nil"`, `""`, `"off"`
+- Everything else is truthy
 
 ## 5. SQL Execution Layer
 
