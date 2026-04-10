@@ -265,6 +265,20 @@ Inspired by PostgreSQL's `psql` meta-commands. Uses a stack-based approach:
 |-----------|------|-----------------|
 | SELECT/SHOW/DESCRIBE/EXPLAIN | `mysql-select conn sql nil 'full` | Table or vertical formatting |
 | USE | `mysql-execute` | Update connection-info and mode-line |
+
+### Auto-Reconnect
+
+When `isqlm-auto-reconnect` is non-nil (default), `isqlm--execute-sql` wraps execution in a retry loop:
+
+1. Execute the SQL via `isqlm--execute-sql-1`
+2. If execution signals an error, check `isqlm--connection-lost-p` — it matches common lost-connection messages (`"lost connection"`, `"server has gone away"`, `"closed database"`, etc.) and also tests `(isqlm--connected-p)`
+3. If the connection is lost, call `isqlm--try-auto-reconnect`:
+   - Close the old (dead) connection handle silently
+   - Re-open with the saved `isqlm-connection-info` (including the last `\use`'d database)
+   - Output `"Lost connection. Trying to reconnect..."` and `"Reconnected to ..."`
+4. Re-execute the original SQL — if this second attempt also fails, the error propagates normally
+
+This mimics the MySQL CLI's behavior: when the server crashes/restarts, the next query transparently reconnects (preserving the current database) and retries.
 | Other (INSERT/UPDATE/DDL…) | `mysql-execute` | Display affected rows |
 
 ### SQL Terminators
@@ -400,6 +414,7 @@ All options belong to the `isqlm` customize group:
 | `isqlm-default-user` | `"root"` | Default user |
 | `isqlm-default-database` | `""` | Default database |
 | `isqlm-prompt-password` | `nil` | Prompt for password on connect |
+| `isqlm-auto-reconnect` | `t` | Auto-reconnect on connection loss |
 | `isqlm-max-column-width` | `0` | Max column width (0 = auto/window width) |
 | `isqlm-max-rows` | `1000` | Max rows displayed |
 | `isqlm-null-string` | `"NULL"` | Display string for NULL |

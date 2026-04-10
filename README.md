@@ -10,6 +10,7 @@ through the [`mysql-el`](https://github.com/swida/mysql-el) dynamic module (C FF
 - **Zero external processes** — no shell, no `mysql` CLI, no comint; pure Elisp + C module
 - **Built-in commands** prefixed with `\` (e.g. `\connect`, `\help`, `\style`)
 - **`sql-connection-alist` integration** — reuse Emacs's standard connection definitions
+- **Auto-reconnect** — automatically reconnects and retries when the server connection is lost
 - **Multi-statement execution** — `select 1; select 2;` executes each statement and shows all results
 - **Tabular result display** with ASCII or Unicode box-drawing borders
 - **Vertical display** — end SQL with `\G` for row-per-field output
@@ -410,6 +411,7 @@ All options are in the `isqlm` customize group (`M-x customize-group RET isqlm`)
 | `isqlm-default-port` | `3306` | Default port |
 | `isqlm-default-user` | `"root"` | Default user |
 | `isqlm-prompt-password` | `nil` | Prompt for password on connect |
+| `isqlm-auto-reconnect` | `t` | Auto-reconnect on connection loss |
 | `isqlm-noisy` | `t` | Beep on errors |
 
 ## Extending with Custom Commands

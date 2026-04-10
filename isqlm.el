@@ -81,6 +81,13 @@ When non-nil, `\\connect' always asks for a password via the echo area.
 When nil, an empty password is used (useful for passwordless local connections)."
   :type 'boolean :group 'isqlm)
 
+(defcustom isqlm-auto-reconnect t
+  "Whether to automatically reconnect when the connection is lost.
+When non-nil, if a SQL execution fails due to a lost connection,
+isqlm will attempt to reconnect using the last connection parameters
+and re-execute the failed SQL statement."
+  :type 'boolean :group 'isqlm)
+
 (defcustom isqlm-max-column-width 0
   "Maximum column width in result tables.
 0 means no artificial limit — columns will be as wide as needed,
@@ -277,6 +284,55 @@ handles both formats."
   "Return non-nil if this buffer has a live MySQL connection."
   (and isqlm-connection
        (condition-case nil (mysqlp isqlm-connection) (error nil))))
+
+(defun isqlm--connection-lost-p (err)
+  "Return non-nil if ERR indicates a lost MySQL connection.
+Checks for common MySQL error messages indicating server disconnect."
+  (let ((msg (downcase (isqlm--error-message err))))
+    (or (string-match-p "lost connection" msg)
+        (string-match-p "server has gone away" msg)
+        (string-match-p "connection was killed" msg)
+        (string-match-p "closed database" msg)
+        (string-match-p "can't connect" msg)
+        ;; Also detect when mysqlp fails (handle invalidated)
+        (not (isqlm--connected-p)))))
+
+(defun isqlm--try-auto-reconnect ()
+  "Attempt to reconnect using the last connection parameters.
+Returns non-nil if reconnection succeeded."
+  (when (and isqlm-auto-reconnect isqlm-connection-info)
+    (let* ((info isqlm-connection-info)
+           (host     (plist-get info :host))
+           (user     (plist-get info :user))
+           (password (plist-get info :password))
+           (database (plist-get info :database))
+           (port     (plist-get info :port)))
+      (isqlm--output-info "Lost connection. Trying to reconnect...\n")
+      ;; Close old connection silently
+      (condition-case nil
+          (when isqlm-connection (mysql-close isqlm-connection))
+        (error nil))
+      (setq isqlm-connection nil)
+      (condition-case err
+          (progn
+            (setq isqlm-connection
+                  (mysql-open host user (or password "")
+                              (if (string= database "") nil database) port))
+            (setq isqlm-connection-info
+                  (list :host host :port port :user user
+                        :password password :database database))
+            (setq mode-line-process
+                  (list (format " [%s]" (isqlm--format-connection-info))))
+            (force-mode-line-update)
+            (isqlm--output-info
+             (format "Reconnected to %s\nCurrent database: %s\n\n"
+                     (isqlm--format-connection-info)
+                     (if (string= database "") "(none)" database)))
+            t)
+        (error
+         (isqlm--output-error
+          (format "*** Reconnection failed *** %s\n" (isqlm--error-message err)))
+         nil)))))
 
 (defun isqlm--format-connection-info ()
   "Return a human-readable connection description string."
@@ -826,10 +882,31 @@ Cells containing newlines are split across multiple display lines."
 ;; ============================================================
 
 (defun isqlm--execute-sql (sql)
-  "Execute SQL and return formatted output string."
-  (unless (isqlm--connected-p)
+  "Execute SQL and return formatted output string.
+If the connection is lost during execution and `isqlm-auto-reconnect'
+is non-nil, automatically reconnect and retry the SQL once."
+  (unless (or (isqlm--connected-p) isqlm-connection-info)
     (error "Not connected.  Use `\\connect' or M-x isqlm-connect"))
+  ;; Try to auto-reconnect if not currently connected but have info
+  (when (and (not (isqlm--connected-p)) isqlm-connection-info)
+    (unless (isqlm--try-auto-reconnect)
+      (error "Not connected.  Use `\\connect' or M-x isqlm-connect")))
   (setq isqlm-last-query sql)
+  (condition-case err
+      (isqlm--execute-sql-1 sql)
+    (error
+     ;; On connection loss, try reconnect + retry once
+     (if (and isqlm-auto-reconnect
+              isqlm-connection-info
+              (isqlm--connection-lost-p err))
+         (if (isqlm--try-auto-reconnect)
+             (isqlm--execute-sql-1 sql)
+           (signal (car err) (cdr err)))
+       (signal (car err) (cdr err))))))
+
+(defun isqlm--execute-sql-1 (sql)
+  "Internal: execute SQL without auto-reconnect logic.
+Returns formatted output string."
   (let* ((parsed (isqlm--strip-terminator sql))
          (query (car parsed))
          (mode (cdr parsed))
@@ -1092,11 +1169,11 @@ When disabled, empty password is used."
       (isqlm--output-error "No previous connection info.  Use `\\connect' instead.\n")
     (let ((info isqlm-connection-info))
       (isqlm/disconnect)
-      (isqlm/connect (plist-get info :host)
-                     (plist-get info :user)
-                     (plist-get info :password)
-                     (plist-get info :database)
-                     (number-to-string (plist-get info :port))))))
+      (isqlm--do-connect (plist-get info :host)
+                         (plist-get info :user)
+                         (or (plist-get info :password) "")
+                         (plist-get info :database)
+                         (plist-get info :port)))))
 
 (defun isqlm/use (&rest args)
   "Switch to a different database.  ARGS: DATABASE-NAME."
