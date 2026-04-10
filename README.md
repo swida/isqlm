@@ -238,8 +238,50 @@ SQL> \endif
 
 Conditions can be:
 - `:varname` — true if the Emacs variable is bound and non-nil
-- `(elisp-expr)` — true if the expression evaluates to non-nil
-- Literal — true unless `"0"`, `"false"`, `"no"`, `"nil"`, or empty
+- `(elisp-expr)` — true if the expression evaluates to non-nil (`:varname` expanded inside)
+- Literal — true unless `"0"`, `"false"`, `"no"`, `"nil"`, `"off"`, or empty
+
+**Variable reference:**
+
+```
+SQL> \setq debug 1
+SQL> \if :debug
+SQL>     \echo debug mode is on
+SQL> \endif
+```
+
+**Elisp expression** (`:varname` is expanded before evaluation):
+
+```
+SQL> select count(*) as cnt from users;\gset
+SQL> \if (> :cnt 100)
+SQL>     \echo more than 100 users
+SQL> \else
+SQL>     \echo 100 or fewer users
+SQL> \endif
+
+SQL> \if (isqlm--connected-p)
+SQL>     show tables;
+SQL> \endif
+
+SQL> \if (file-exists-p "/tmp/init.sql")
+SQL>     \i /tmp/init.sql
+SQL> \endif
+```
+
+**Literal values:**
+
+```
+SQL> \if yes
+SQL>     \echo always runs
+SQL> \endif
+
+SQL> \if 0
+SQL>     \echo never runs
+SQL> \endif
+```
+
+Falsy values: `nil`, `0`, `0.0`, `""`, `"false"`, `"no"`, `"off"` (case-insensitive).
 
 ### For Loops
 
