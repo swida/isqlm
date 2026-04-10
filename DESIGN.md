@@ -279,6 +279,51 @@ When `isqlm-auto-reconnect` is non-nil (default), `isqlm--execute-sql` wraps exe
 4. Re-execute the original SQL — if this second attempt also fails, the error propagates normally
 
 This mimics the MySQL CLI's behavior: when the server crashes/restarts, the next query transparently reconnects (preserving the current database) and retries.
+
+### Async (Non-blocking) Execution
+
+When `mysql-el` provides the `mysql-query-start` function (requires MySQL 8.0.16+ `libmysqlclient` with `_nonblocking` API), SQL queries are executed **asynchronously** — Emacs remains fully responsive during long-running queries.
+
+**Architecture:**
+
+```
+User presses RET
+  → isqlm--async-execute-statements
+    → isqlm--async-execute-one (for each statement)
+      → mysql-query-start (non-blocking, returns immediately)
+      → run-with-timer (20ms interval)
+        → isqlm--async-poll-query
+          → mysql-query-continue (non-blocking)
+          → when complete: isqlm--async-store-result
+            → mysql-store-result-start (non-blocking)
+            → isqlm--async-poll-store
+              → mysql-store-result-continue
+              → when complete: isqlm--async-process-result
+                → mysql-async-result (sync — data already in client memory)
+                → format and output result
+                → callback → next statement or emit prompt
+```
+
+**Key design points:**
+
+1. **Timer-based polling**: `run-with-timer` at 20ms intervals calls `mysql-query-continue` / `mysql-store-result-continue`, which are non-blocking C calls that return immediately
+2. **Input blocking**: While async query runs, `isqlm--async-busy` is set; `RET` shows "Query in progress... (C-c C-c to cancel)"
+3. **C-c C-c cancellation**: `isqlm-interrupt` calls `isqlm--async-cancel` which cancels the polling timer
+4. **Fallback**: When async API is unavailable (`mysql-query-start` not `fboundp`), falls back to synchronous `isqlm--execute-sql`
+5. **USE statements**: Handled synchronously (fast, no result set)
+6. **Multi-statement**: Statements are chained via callbacks — each statement's completion triggers the next
+
+**C-side async API** (`mysql-el`):
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `mysql-query-start` | `(db sql)` → symbol | Begin async query; returns `'complete`, `'not-ready`, or `'error` |
+| `mysql-query-continue` | `(db)` → symbol | Continue async query |
+| `mysql-store-result-start` | `(db)` → `(status . result)` | Begin fetching result set |
+| `mysql-store-result-continue` | `(db)` → `(status . result)` | Continue fetching result set |
+| `mysql-async-result` | `(db res &optional full)` → list | Convert stored result to Elisp list (no I/O) |
+| `mysql-async-affected-rows` | `(db)` → integer | Affected row count after non-SELECT |
+| `mysql-async-field-count` | `(db)` → integer | Field count (0 = not SELECT) |
 | Other (INSERT/UPDATE/DDL…) | `mysql-execute` | Display affected rows |
 
 ### SQL Terminators
@@ -319,7 +364,7 @@ Each complete statement (including its terminator) is returned as a list element
 
 | Function | Signature | Return value |
 |----------|-----------|--------------|
-| `mysql-open` | `(host user pass db port)` | Connection object |
+| `mysql-open` | `(host user pass db port timeout)` | Connection object |
 | `mysql-close` | `(conn)` | nil |
 | `mysql-select` | `(conn sql &optional types full)` | full mode: `(columns . rows)` |
 | `mysql-execute` | `(conn sql)` | Affected rows (integer) |
@@ -415,6 +460,7 @@ All options belong to the `isqlm` customize group:
 | `isqlm-default-database` | `""` | Default database |
 | `isqlm-prompt-password` | `nil` | Prompt for password on connect |
 | `isqlm-auto-reconnect` | `t` | Auto-reconnect on connection loss |
+| `isqlm-query-timeout` | `30` | Read/write/connect timeout in seconds (0 = no timeout) |
 | `isqlm-max-column-width` | `0` | Max column width (0 = auto/window width) |
 | `isqlm-max-rows` | `1000` | Max rows displayed |
 | `isqlm-null-string` | `"NULL"` | Display string for NULL |
