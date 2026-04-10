@@ -923,6 +923,7 @@ Cells containing newlines are split across multiple display lines."
     "  \\style [ascii|unicode]                       — Toggle/set table style\n"
     "  \\clear                                      — Clear buffer\n"
     "  \\history                                    — Show input history\n"
+    "  \\i FILENAME / \\include FILENAME             — Execute SQL from file\n"
     "  \\echo TEXT...                                — Output text\n"
     "  \\gset [PREFIX]                               — Store last result as variables\n"
     "  \\if CONDITION                                — Begin conditional block\n"
@@ -933,7 +934,7 @@ Cells containing newlines are split across multiple display lines."
     "  \\help                                       — Show this help\n"
     "  \\quit / \\exit                               — Kill ISQLM buffer\n"
     "\n"
-    "Aliases: \\? = \\h = \\help, \\q = \\quit, \\u = \\use\n"
+    "Aliases: \\? = \\h = \\help, \\q = \\quit, \\u = \\use, \\. = \\i\n"
     "\n"
     "Or type any SQL statement ending with `;', `\\G', or `\\gset [PREFIX]'.\n"
     "Press M-RET for a literal newline (multi-line input).\n"
@@ -1136,6 +1137,91 @@ Examples:
         (error
          (isqlm--output-error
           (format "*** Eval Error *** %s\n" (isqlm--error-message err))))))))
+
+(defun isqlm--execute-line (line)
+  "Execute LINE as if typed at the prompt.
+Handles built-in commands, complete SQL, and multi-statement input."
+  (let ((trimmed (string-trim line)))
+    (when (> (length trimmed) 0)
+      (cond
+       ;; Built-in command
+       ((string-prefix-p "\\" trimmed)
+        (isqlm--try-builtin-command trimmed))
+       ;; Complete SQL
+       ((isqlm--sql-complete-p trimmed)
+        (let ((statements (isqlm--split-statements trimmed)))
+          (dolist (stmt statements)
+            (condition-case err
+                (let* ((expanded (isqlm--expand-sql-variables stmt))
+                       (result (isqlm--execute-sql expanded)))
+                  (isqlm--output result))
+              (error
+               (when isqlm-noisy (ding))
+               (isqlm--output-error
+                (format "*** Error *** %s\n"
+                        (isqlm--error-message err))))))))
+       ;; Incomplete SQL — warning
+       (t
+        (isqlm--output-error
+         (format "Incomplete statement: %s\n" trimmed)))))))
+
+(defun isqlm/i (&rest args)
+  "Read and execute SQL from a file (à la psql \\i / \\include).
+ARGS: FILENAME.  The file is read and each line is executed as if
+typed at the prompt.  Multi-line SQL statements (spanning lines
+without terminators) are accumulated until complete."
+  (let ((filename (car args)))
+    (if (not filename)
+        (isqlm--output-error "Usage: \\i FILENAME\n")
+      ;; Expand ~ and resolve path
+      (let ((path (expand-file-name filename)))
+        (if (not (file-readable-p path))
+            (isqlm--output-error (format "Cannot read file: %s\n" path))
+          (isqlm--output-info (format "Executing: %s\n" path))
+          (let ((pending ""))
+            (with-temp-buffer
+              (insert-file-contents path)
+              (goto-char (point-min))
+              (while (not (eobp))
+                (let ((line (buffer-substring-no-properties
+                             (line-beginning-position) (line-end-position))))
+                  (setq pending (concat pending
+                                        (if (string= pending "") "" "\n")
+                                        line))
+                  (cond
+                   ;; Built-in command on its own line (no pending SQL)
+                   ((and (string= (string-trim
+                                   (concat "" (if (string-match "\n" pending)
+                                                   ""
+                                                 pending)))
+                                  (string-trim line))
+                         (string-prefix-p "\\" (string-trim pending))
+                         (not (string-match "\n" pending)))
+                    (isqlm--execute-line pending)
+                    (setq pending ""))
+                   ;; Complete SQL — execute
+                   ((isqlm--sql-complete-p pending)
+                    (let ((statements (isqlm--split-statements pending)))
+                      (dolist (stmt statements)
+                        (condition-case err
+                            (let* ((expanded (isqlm--expand-sql-variables stmt))
+                                   (result (isqlm--execute-sql expanded)))
+                              (isqlm--output result))
+                          (error
+                           (when isqlm-noisy (ding))
+                           (isqlm--output-error
+                            (format "*** Error *** %s\n"
+                                    (isqlm--error-message err)))))))
+                    (setq pending ""))))
+                (forward-line 1)))
+            ;; Handle any remaining incomplete input
+            (when (> (length (string-trim pending)) 0)
+              (isqlm--output-error
+               (format "Unterminated statement at end of file: %s\n"
+                       (string-trim pending))))))))))
+
+(defalias 'isqlm/include #'isqlm/i
+  "Alias for `isqlm/i'.  Read and execute SQL from a file.")
 
 (defun isqlm/clear (&rest _args)
   "Clear the ISQLM buffer."
@@ -1408,29 +1494,7 @@ Each line is processed as if typed at the prompt."
   (dolist (val values)
     (set var val)
     (dolist (line body)
-      (let ((trimmed (string-trim line)))
-        (when (> (length trimmed) 0)
-          (cond
-           ;; Built-in command
-           ((string-prefix-p "\\" trimmed)
-            (isqlm--try-builtin-command trimmed))
-           ;; SQL (may need terminator)
-           ((isqlm--sql-complete-p trimmed)
-            (let ((statements (isqlm--split-statements trimmed)))
-              (dolist (stmt statements)
-                (condition-case err
-                    (let* ((expanded (isqlm--expand-sql-variables stmt))
-                           (result (isqlm--execute-sql expanded)))
-                      (isqlm--output result))
-                  (error
-                   (when isqlm-noisy (ding))
-                   (isqlm--output-error
-                    (format "*** Error *** %s\n"
-                            (isqlm--error-message err))))))))
-           ;; Incomplete SQL — just output warning
-           (t
-            (isqlm--output-error
-             (format "Incomplete statement in \\for body: %s\n" trimmed)))))))))
+      (isqlm--execute-line line))))
 
 (defconst isqlm--cond-flow-commands '("if" "elif" "else" "endif")
   "List of conditional flow command names.")
@@ -1492,7 +1556,8 @@ When in an inactive branch, only \\if (to track nesting) and
   '(("?" . "help")
     ("h" . "help")
     ("q" . "quit")
-    ("u" . "use"))
+    ("u" . "use")
+    ("." . "i"))
   "Alist mapping command aliases to canonical command names.
 E.g. \\? and \\h both map to \\help.")
 

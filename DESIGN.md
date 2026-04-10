@@ -189,11 +189,12 @@ This expansion happens after statement splitting and before `isqlm--execute-sql`
 | `\else` | `isqlm/else` | Else branch |
 | `\endif` | `isqlm/endif` | End conditional block |
 | `\gset` | `isqlm/gset` | Store last query result as variables |
+| `\i`/`\include` | `isqlm/i` | Execute SQL from file |
 | `\clear` | `isqlm/clear` | Clear buffer |
 | `\history` | `isqlm/history` | Show history |
 | `\quit`/`\exit` | `isqlm/quit` `isqlm/exit` | Quit |
 
-Aliases: `\?` = `\h` = `\help`, `\q` = `\quit`, `\u` = `\use`
+Aliases: `\?` = `\h` = `\help`, `\q` = `\quit`, `\u` = `\use`, `\.` = `\i`
 
 Unknown `\` commands that are not Emacs Lisp functions produce an error message.
 

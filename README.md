@@ -156,10 +156,11 @@ All built-in commands are prefixed with `\`:
 | `\eval EXPRESSION` | Evaluate Elisp expression |
 | `\for VAR in V1 V2 ... { body }` | Loop over values |
 | `\gset [PREFIX]` | Store last query result as variables |
+| `\i FILENAME` / `\include FILENAME` | Execute SQL from file |
 | `\help` | Show help |
 | `\quit` / `\exit` | Disconnect and kill buffer |
 
-**Aliases:** `\?` = `\h` = `\help`, `\q` = `\quit`, `\u` = `\use`
+**Aliases:** `\?` = `\h` = `\help`, `\q` = `\quit`, `\u` = `\use`, `\.` = `\i`
 
 ### Elisp Functions & Variables
 
