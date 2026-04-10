@@ -174,10 +174,11 @@ This expansion happens after statement splitting and before `isqlm--execute-sql`
 | User input | Function | Description |
 |------------|----------|-------------|
 | `\help` | `isqlm/help` | Show help |
-| `\connect` | `isqlm/connect` | Connect (prompts for missing args) |
+| `\connect` | `isqlm/connect` | Connect (password via echo area) |
 | `\connections` | `isqlm/connections` | List `sql-connection-alist` entries |
 | `\disconnect` | `isqlm/disconnect` | Disconnect |
 | `\reconnect` | `isqlm/reconnect` | Reconnect with last params |
+| `\password` | `isqlm/password` | Toggle password prompting |
 | `\use` | `isqlm/use` | Switch database |
 | `\status` | `isqlm/status` | Show connection status |
 | `\style` | `isqlm/style` | Toggle/set table border style |
@@ -398,6 +399,7 @@ All options belong to the `isqlm` customize group:
 | `isqlm-default-port` | `3306` | Default port |
 | `isqlm-default-user` | `"root"` | Default user |
 | `isqlm-default-database` | `""` | Default database |
+| `isqlm-prompt-password` | `nil` | Prompt for password on connect |
 | `isqlm-max-column-width` | `0` | Max column width (0 = auto/window width) |
 | `isqlm-max-rows` | `1000` | Max rows displayed |
 | `isqlm-null-string` | `"NULL"` | Display string for NULL |
@@ -418,7 +420,7 @@ All options belong to the `isqlm` customize group:
 - `M-x isqlm-sql-connect` — Select from `sql-connection-alist` with completion, open `*isqlm:NAME*`
 - `M-x isqlm-connect-and-run` — Start and immediately connect
 - `\connect NAME` at the prompt — Connect using a `sql-connection-alist` entry
-- `\connect HOST USER PASS DB PORT` at the prompt — Connect with explicit parameters
+- `\connect [HOST] [USER] [DB] [PORT]` at the prompt — Connect with positional parameters (all optional, defaults applied); password prompted via echo area
 
 ## 12.1 Sending SQL from External Buffers
 

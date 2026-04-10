@@ -54,7 +54,8 @@ M-x isqlm
 Then at the `SQL>` prompt:
 
 ```
-SQL> \connect 127.0.0.1 root mypassword mydb 3306
+SQL> \connect 127.0.0.1 root mydb 3306
+Password: ********
 Connected to root@127.0.0.1:3306/mydb (MySQL client library: 8.0.36)
 SQL> SELECT * FROM users LIMIT 2;
 +----+-------+-------------------+
@@ -64,6 +65,24 @@ SQL> SELECT * FROM users LIMIT 2;
 | 2  | Bob   | bob@example.com   |
 +----+-------+-------------------+
 2 rows in set
+```
+
+All positional parameters are optional — omitted ones use defaults:
+
+```
+SQL> \connect                        ← use all defaults (127.0.0.1 root "" 3306)
+SQL> \connect 10.0.0.1               ← only specify host
+SQL> \connect 10.0.0.1 admin         ← host + user
+SQL> \connect 10.0.0.1 admin mydb    ← host + user + database
+```
+
+To skip password prompting (e.g. passwordless local connections):
+
+```
+SQL> \password
+Password prompting: OFF
+SQL> \connect
+Connected to root@127.0.0.1:3306/ (MySQL client library: 8.0.36)
 ```
 
 ### Option 2: Connect via `sql-connection-alist`
@@ -110,7 +129,8 @@ If `sql-password` is omitted from a connection entry, you will be prompted for i
 ### Option 3: Connect from Lisp
 
 ```elisp
-(isqlm-connect-and-run "127.0.0.1" "root" "password" "mydb" 3306)
+(isqlm-connect-and-run "127.0.0.1" "root" "mydb" 3306)
+;; password will be prompted in echo area if isqlm-prompt-password is non-nil
 ```
 
 ### Table Styles
@@ -137,11 +157,11 @@ All built-in commands are prefixed with `\`:
 | Command | Description |
 |---------|-------------|
 | `\connect [NAME]` | Connect using a `sql-connection-alist` entry |
-| `\connect HOST USER PASS DB PORT` | Connect with explicit parameters |
-| `\connect` | Connect interactively (prompts for each parameter) |
+| `\connect [HOST] [USER] [DB] [PORT]` | Connect with explicit parameters (all optional, defaults applied) |
 | `\connections` | List available connections from `sql-connection-alist` |
 | `\disconnect` | Disconnect |
 | `\reconnect` | Reconnect with last parameters |
+| `\password` | Toggle whether `\connect` prompts for a password |
 | `\use DATABASE` | Switch database |
 | `\status` | Show connection status |
 | `\style [ascii\|unicode]` | Toggle or set table border style |
@@ -389,6 +409,7 @@ All options are in the `isqlm` customize group (`M-x customize-group RET isqlm`)
 | `isqlm-default-host` | `"127.0.0.1"` | Default host |
 | `isqlm-default-port` | `3306` | Default port |
 | `isqlm-default-user` | `"root"` | Default user |
+| `isqlm-prompt-password` | `nil` | Prompt for password on connect |
 | `isqlm-noisy` | `t` | Beep on errors |
 
 ## Extending with Custom Commands

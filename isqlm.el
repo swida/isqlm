@@ -75,6 +75,12 @@
 (defcustom isqlm-default-database ""
   "Default MySQL database." :type 'string :group 'isqlm)
 
+(defcustom isqlm-prompt-password nil
+  "Whether to prompt for password when connecting.
+When non-nil, `\\connect' always asks for a password via the echo area.
+When nil, an empty password is used (useful for passwordless local connections)."
+  :type 'boolean :group 'isqlm)
+
 (defcustom isqlm-max-column-width 0
   "Maximum column width in result tables.
 0 means no artificial limit — columns will be as wide as needed,
@@ -920,11 +926,12 @@ Cells containing newlines are split across multiple display lines."
     "  \\quit / \\exit          kill ISQLM buffer\n"
     "\n"
     "Connection\n"
-    "  \\connect [NAME | HOST USER PASS DB PORT]\n"
+    "  \\connect [NAME | [HOST] [USER] [DB] [PORT]]\n"
     "                         connect to MySQL server\n"
     "  \\connections           list connections from sql-connection-alist\n"
     "  \\disconnect            disconnect from server\n"
     "  \\reconnect             reconnect with last parameters\n"
+    "  \\password              toggle password prompting on connect\n"
     "  \\status                show connection status\n"
     "\n"
     "Input/Output\n"
@@ -999,8 +1006,14 @@ Return a plist (:host :user :password :database :port) or nil."
 
 Usage:
   \\connect NAME              — connect using sql-connection-alist entry
-  \\connect HOST USER PASS DB PORT — connect with explicit parameters
-  \\connect                   — prompt for all parameters interactively"
+  \\connect [HOST] [USER] [DB] [PORT] — connect with explicit parameters
+                                 (all optional, defaults applied)
+  \\connect                   — use all defaults
+
+Password is never specified on the command line.
+When `isqlm-prompt-password' is non-nil (default), password is prompted
+via the echo area.  Set it to nil with:
+  \\password                  — toggle password prompting"
   (isqlm--ensure-module)
   (when (isqlm--connected-p)
     (isqlm--output-info "Disconnecting current session...\n")
@@ -1013,54 +1026,54 @@ Usage:
         (let ((host     (plist-get conn-info :host))
               (user     (plist-get conn-info :user))
               (password (or (plist-get conn-info :password)
-                            (read-passwd "Password: ")))
+                            (if isqlm-prompt-password
+                                (read-passwd "Password: ")
+                              "")))
               (database (plist-get conn-info :database))
               (port     (plist-get conn-info :port)))
-          (condition-case err
-              (progn
-                (setq isqlm-connection
-                      (mysql-open host user password
-                                  (if (string= database "") nil database) port))
-                (setq isqlm-connection-info
-                      (list :host host :port port :user user
-                            :password password :database database))
-                (setq mode-line-process
-                      (list (format " [%s]" (isqlm--format-connection-info))))
-                (force-mode-line-update)
-                (let ((ver (condition-case nil (mysql-version) (error "unknown"))))
-                  (isqlm--output-info
-                   (format "Connected to %s (MySQL client library: %s)\n"
-                           (isqlm--format-connection-info) ver)))
-                (setq isqlm-pending-input ""))
-            (error
-             (isqlm--output-error
-              (format "*** Connection Error *** %s\n" (isqlm--error-message err))))))
-      ;; Connect with explicit args or prompts
-      (let* ((host     (or (nth 0 args) (read-string (format "Host (default %s): " isqlm-default-host) nil nil isqlm-default-host)))
-             (user     (or (nth 1 args) (read-string (format "User (default %s): " isqlm-default-user) nil nil isqlm-default-user)))
-             (password (or (nth 2 args) (read-passwd "Password: ")))
-             (database (or (nth 3 args) (read-string (format "Database (default %s): " isqlm-default-database) nil nil isqlm-default-database)))
-             (port     (or (and (nth 4 args) (string-to-number (nth 4 args)))
-                           (read-number "Port: " isqlm-default-port))))
-        (condition-case err
-            (progn
-              (setq isqlm-connection
-                    (mysql-open host user password
-                                (if (string= database "") nil database) port))
-              (setq isqlm-connection-info
-                    (list :host host :port port :user user
-                          :password password :database database))
-              (setq mode-line-process
-                    (list (format " [%s]" (isqlm--format-connection-info))))
-              (force-mode-line-update)
-              (let ((ver (condition-case nil (mysql-version) (error "unknown"))))
-                (isqlm--output-info
-                 (format "Connected to %s (MySQL client library: %s)\n"
-                         (isqlm--format-connection-info) ver)))
-              (setq isqlm-pending-input ""))
-          (error
-           (isqlm--output-error
-            (format "*** Connection Error *** %s\n" (isqlm--error-message err)))))))))
+          (isqlm--do-connect host user password database port))
+      ;; Connect with explicit positional args; all optional, defaults applied
+      (let* ((host     (or (nth 0 args) isqlm-default-host))
+             (user     (or (nth 1 args) isqlm-default-user))
+             (database (or (nth 2 args) isqlm-default-database))
+             (port     (or (and (nth 3 args) (string-to-number (nth 3 args)))
+                           isqlm-default-port))
+             (password (if isqlm-prompt-password
+                           (read-passwd "Password: ")
+                         "")))
+        (isqlm--do-connect host user password database port)))))
+
+(defun isqlm--do-connect (host user password database port)
+  "Perform the actual MySQL connection.
+HOST, USER, PASSWORD, DATABASE, PORT are connection parameters."
+  (condition-case err
+      (progn
+        (setq isqlm-connection
+              (mysql-open host user password
+                          (if (string= database "") nil database) port))
+        (setq isqlm-connection-info
+              (list :host host :port port :user user
+                    :password password :database database))
+        (setq mode-line-process
+              (list (format " [%s]" (isqlm--format-connection-info))))
+        (force-mode-line-update)
+        (let ((ver (condition-case nil (mysql-version) (error "unknown"))))
+          (isqlm--output-info
+           (format "Connected to %s (MySQL client library: %s)\n"
+                   (isqlm--format-connection-info) ver)))
+        (setq isqlm-pending-input ""))
+    (error
+     (isqlm--output-error
+      (format "*** Connection Error *** %s\n" (isqlm--error-message err))))))
+
+(defun isqlm/password (&rest _args)
+  "Toggle whether \\connect prompts for a password.
+When enabled, \\connect will ask for password via echo area.
+When disabled, empty password is used."
+  (setq isqlm-prompt-password (not isqlm-prompt-password))
+  (isqlm--output-info
+   (format "Password prompting: %s\n"
+           (if isqlm-prompt-password "ON" "OFF"))))
 
 (defun isqlm/disconnect (&rest _args)
   "Disconnect from MySQL."
@@ -1888,11 +1901,16 @@ Otherwise, insert a continuation prompt for multi-line input."
 ;; Interactive commands (for keybindings / M-x)
 ;; ============================================================
 
-(defun isqlm-connect (&optional host user password database port)
-  "Connect to MySQL interactively or from Lisp."
+(defun isqlm-connect (&optional host user database port)
+  "Connect to MySQL interactively or from Lisp.
+PASSWORD is prompted via echo area when `isqlm-prompt-password' is non-nil."
   (interactive)
-  (isqlm/connect host user password database
-                 (and port (number-to-string port))))
+  (let ((args nil))
+    (when port (push (number-to-string port) args))
+    (when database (push database args))
+    (when user (push user args))
+    (when host (push host args))
+    (apply #'isqlm/connect args)))
 
 (defun isqlm-disconnect ()
   "Disconnect from MySQL."
@@ -2103,11 +2121,11 @@ Switches to buffer BUF-NAME (`*isqlm*' by default) or creates it."
     (pop-to-buffer-same-window buf)))
 
 ;;;###autoload
-(defun isqlm-connect-and-run (&optional host user password database port)
+(defun isqlm-connect-and-run (&optional host user database port)
   "Start ISQLM and immediately connect."
   (interactive)
   (isqlm)
-  (isqlm-connect host user password database port))
+  (isqlm-connect host user database port))
 
 ;;;###autoload
 (defun isqlm-sql-connect (connection)
