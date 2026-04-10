@@ -468,3 +468,40 @@ No registration needed — `isqlm--try-builtin-command` auto-discovers `\`-prefi
 7. **`\quit`/`\exit` kills the buffer** — `isqlm-send-input` checks `(buffer-live-p isqlm-buf)` afterward to avoid operating on a dead buffer
 8. **Multi-statement input is split by `isqlm--split-statements`** — it's quote/comment-aware; each statement is executed individually via `isqlm--execute-sql`
 9. **Use `isqlm--error-message` instead of `error-message-string`** — mysql-el signals errors with a plain string data, which `error-message-string` cannot parse
+
+## 14. Unit Tests
+
+Test file: `isqlm-test.el` — uses Emacs's built-in `ert` (Emacs Regression Testing) framework.
+
+### Running Tests
+
+```bash
+emacs -batch -l isqlm.el -l isqlm-test.el -f ert-run-tests-batch-and-exit
+```
+
+### Test Infrastructure
+
+**`isqlm-test-with-buffer`** — macro that creates a temporary buffer with all buffer-local variables (`isqlm-pending-input`, `isqlm-cond-stack`, `isqlm-for-stack`, markers, etc.) properly initialized. No MySQL connection or `mysql-el` module required. Used for tests that exercise buffer-level logic (conditional flow stack operations, script execution, etc.).
+
+**`isqlm-test-with-dynvars`** — macro that works around `lexical-binding: t`. Since `let` in lexical-binding mode creates lexical bindings invisible to `symbol-value`/`boundp`, this macro uses `set` to create true dynamic bindings, and `makunbound` to clean up afterward. Used for variable expansion tests where `:varname` references rely on `symbol-value`.
+
+### Test Coverage
+
+| Category | Tests | What is verified |
+|----------|-------|-----------------|
+| SQL Parsing | `isqlm-test-sql-complete-p`, `isqlm-test-strip-terminator`, `isqlm-test-split-statements` | Statement completeness detection (`;`, `\G`, `\gset`), terminator stripping, multi-statement splitting (quote-aware, comment-aware, `\gset` vs `\G` disambiguation) |
+| Conditional Flow — Values | `isqlm-test-cond-falsy-value-p`, `isqlm-test-cond-truthy-p-literal`, `isqlm-test-cond-truthy-p-variable`, `isqlm-test-cond-truthy-p-elisp`, `isqlm-test-cond-truthy-p-elisp-with-varref` | Falsy detection (nil/0/""/"false"/"no"/"off"), truthy literals, `:varname` references, Elisp expressions, `:varname` inside Elisp expressions |
+| Conditional Flow — Stack | `isqlm-test-if-else-endif`, `isqlm-test-if-elif`, `isqlm-test-nested-if` | `\if`/`\else`/`\endif` toggling, `\elif` chain (only first true branch active), nested `\if` blocks |
+| Conditional Flow — Scripts | `isqlm-test-script-if-else`, `isqlm-test-script-if-elisp-varref` | Regression tests: `\if`/`\else` in `isqlm--execute-script`, `:varname` expansion inside Elisp conditions in scripts |
+| Command Parsing | `isqlm-test-parse-command-line` | Tokenization with double-quoted strings |
+| Variable Expansion | `isqlm-test-expand-arg`, `isqlm-test-expand-sql-variables`, `isqlm-test-expand-expr-variables` | `:varname` argument expansion, SQL `:var`/`::var` expansion (quoting, escaping, NULL, inside-string immunity), Elisp expression `:varname` expansion |
+| Command Aliases | `isqlm-test-command-aliases` | Alias alist entries (`?`→`help`, `h`→`help`, `q`→`quit`, `u`→`use`, `.`→`i`) |
+| Conditional Detection | `isqlm-test-cond-flow-command-p` | `isqlm--cond-flow-command-p` correctly identifies `\if`/`\elif`/`\else`/`\endif` and rejects others |
+| Display Width | `isqlm-test-display-width` | Multi-line string width calculation for table rendering |
+| Error Messages | `isqlm-test-error-message` | `isqlm--error-message` handles mysql-el's `(error . "string")` and standard `(error "fmt" args...)` formats |
+
+### Design Principles
+
+1. **No MySQL dependency**: All tests run without a MySQL server or the `mysql-el` module. Buffer-level logic and pure functions are tested in isolation.
+2. **Regression-driven**: Key tests were added in response to specific bugs (e.g., `\if` ignored in scripts, `:varname` treated as Elisp keyword in `\if` expressions).
+3. **Output capture**: Script execution tests use `cl-letf` to temporarily replace `isqlm--output`/`isqlm--output-info`/`isqlm--output-error` with lambda functions that capture output into a list, enabling assertions on what would have been displayed.
