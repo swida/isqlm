@@ -1340,19 +1340,38 @@ Falsy: nil, 0, empty string, or strings \"0\"/\"false\"/\"no\"/\"nil\"/\"off\"."
       (and (stringp v)
            (member (downcase v) '("" "0" "false" "no" "nil" "off")))))
 
+(defun isqlm--expand-expr-variables (expr)
+  "Expand `:varname' references in EXPR string to variable values.
+Replaces `:name' with the variable's value (as a Lisp literal) for
+use in Elisp expressions.  Does not expand `::' (keyword symbols)."
+  (replace-regexp-in-string
+   ":\\([a-zA-Z_][a-zA-Z0-9_-]*\\)"
+   (lambda (match)
+     (let* ((name (match-string 1 match))
+            (sym (intern-soft name)))
+       (if (and sym (boundp sym))
+           (let ((val (symbol-value sym)))
+             (cond
+              ((null val) "nil")
+              ((stringp val) (format "%S" val))
+              (t (format "%s" val))))
+         match)))  ; leave unchanged if not bound
+   expr t t))
+
 (defun isqlm--cond-truthy-p (val)
   "Return non-nil if VAL is \"truthy\" for \\if/\\elif conditions.
 VAL is a string from the command line.  Supported forms:
   :varname     — look up Emacs variable, check its value
-  (elisp-expr) — evaluate, check result
+  (elisp-expr) — evaluate, check result; :varname expanded inside
   literal      — check against falsy list"
   (cond
    ((null val) nil)
    ((string= val "") nil)
-   ;; Elisp expression
+   ;; Elisp expression — expand :var references first
    ((string-prefix-p "(" val)
     (condition-case nil
-        (not (isqlm--cond-falsy-value-p (eval (read val) t)))
+        (let ((expanded (isqlm--expand-expr-variables val)))
+          (not (isqlm--cond-falsy-value-p (eval (read expanded) t))))
       (error nil)))
    ;; Variable reference with :
    ((string-prefix-p ":" val)
