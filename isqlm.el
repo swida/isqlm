@@ -142,6 +142,10 @@ up to the current window width minus table borders."
 (defvar-local isqlm-connection-info nil)
 (defvar-local isqlm-pending-input "")
 (defvar-local isqlm-prompt-internal nil)
+(defvar-local isqlm-last-query nil
+  "The last SQL query executed, for use by \\gset.")
+(defvar-local isqlm-last-result nil
+  "The last SELECT query result as (COLUMNS . ROWS), for use by \\gset.")
 (defvar-local isqlm-last-input-start nil)
 (defvar-local isqlm-last-input-end nil)
 (defvar-local isqlm-last-output-start nil)
@@ -416,16 +420,29 @@ handles both formats."
 ;; ============================================================
 
 (defun isqlm--sql-complete-p (sql)
-  "Return non-nil if SQL is a complete statement (ends with `;' or `\\G')."
+  "Return non-nil if SQL is a complete statement.
+Complete if it ends with `;', `\\G', or `\\gset [PREFIX]'."
   (let ((trimmed (string-trim-right sql)))
     (or (string-suffix-p ";" trimmed)
         (string-suffix-p "\\G" trimmed)
+        (string-match-p "\\\\gset\\(?:\\s-+\\S-+\\)?\\s-*$" trimmed)
         (string= trimmed ""))))
 
 (defun isqlm--strip-terminator (sql)
-  "Remove trailing `;'/`\\G' from SQL.  Return (BODY . VERTICAL-P)."
+  "Remove trailing terminator from SQL.
+Return (BODY . MODE) where MODE is:
+  nil       — normal (terminated by `;')
+  t         — vertical display (terminated by `\\G')
+  (:gset PREFIX) — store result as variables (terminated by `\\gset [PREFIX]')"
   (let ((trimmed (string-trim-right sql)))
     (cond
+     ((string-match "\\\\gset\\(?:\\s-+\\(\\S-+\\)\\)?\\s-*$" trimmed)
+      (let* ((prefix (or (match-string 1 trimmed) ""))
+             (body (string-trim-right (substring trimmed 0 (match-beginning 0)))))
+        ;; Also strip trailing ; (supports "stmt;\gset prefix")
+        (when (string-suffix-p ";" body)
+          (setq body (string-trim-right (substring body 0 -1))))
+        (cons body (list :gset prefix))))
      ((string-suffix-p "\\G" trimmed)
       (cons (string-trim-right (substring trimmed 0 -2)) t))
      ((string-suffix-p ";" trimmed)
@@ -589,20 +606,55 @@ Handles quoted strings and comments to avoid splitting inside them."
            ;; /* block comment
            ((and (= ch ?/) (< (1+ i) len) (= (aref sql (1+ i)) ?*))
             (setq in-block-comment t) (cl-incf i))
-           ;; \G terminator
+           ;; \gset [PREFIX] terminator — must check before \G
+           ((and (= ch ?\\) (< (+ i 4) len)
+                 (string-match-p "\\`\\\\gset\\(?:\\s-\\|$\\)"
+                                 (substring sql i (min len (+ i 20)))))
+            ;; Find end of \gset [prefix]: scan to end of line or string
+            (let ((j (+ i 5)))  ; skip past "\gset"
+              ;; Skip optional whitespace + prefix
+              (while (and (< j len)
+                          (not (memq (aref sql j) '(?\n ?\; ?\\))))
+                (cl-incf j))
+              (let ((stmt (string-trim (substring sql start j))))
+                (when (> (length stmt) 0)
+                  (push stmt statements)))
+              (setq i (1- j))
+              (setq start j)))
+           ;; \G terminator (but NOT \gset)
            ((and (= ch ?\\) (< (1+ i) len)
-                 (memq (aref sql (1+ i)) '(?G ?g)))
+                 (memq (aref sql (1+ i)) '(?G ?g))
+                 (or (>= (+ i 2) len)
+                     (not (memq (aref sql (+ i 2)) '(?s ?S)))))
             (let ((stmt (string-trim (substring sql start (+ i 2)))))
               (when (> (length stmt) 0)
                 (push stmt statements)))
             (cl-incf i)
             (setq start (1+ i)))
-           ;; ; terminator
+           ;; ; terminator — but check if \gset follows
            ((= ch ?\;)
-            (let ((stmt (string-trim (substring sql start (1+ i)))))
-              (when (> (length stmt) 0)
-                (push stmt statements)))
-            (setq start (1+ i)))))))
+            ;; Look ahead: skip whitespace, check for \gset
+            (let ((peek (1+ i)))
+              (while (and (< peek len) (memq (aref sql peek) '(?\s ?\t)))
+                (cl-incf peek))
+              (if (and (< (+ peek 4) len)
+                       (string-match-p "\\`\\\\gset\\(?:\\s-\\|$\\)"
+                                       (substring sql peek (min len (+ peek 20)))))
+                  ;; ;\gset [prefix] — consume through end of \gset
+                  (let ((j (+ peek 5))) ; skip past \gset
+                    (while (and (< j len)
+                                (not (memq (aref sql j) '(?\n ?\;))))
+                      (cl-incf j))
+                    (let ((stmt (string-trim (substring sql start j))))
+                      (when (> (length stmt) 0)
+                        (push stmt statements)))
+                    (setq i (1- j))
+                    (setq start j))
+                ;; Normal ; terminator
+                (let ((stmt (string-trim (substring sql start (1+ i)))))
+                  (when (> (length stmt) 0)
+                    (push stmt statements)))
+                (setq start (1+ i)))))))))
       (cl-incf i))
     ;; Remainder (no terminator)
     (let ((rest (string-trim (substring sql start))))
@@ -771,13 +823,34 @@ Cells containing newlines are split across multiple display lines."
   "Execute SQL and return formatted output string."
   (unless (isqlm--connected-p)
     (error "Not connected.  Use `\\connect' or M-x isqlm-connect"))
+  (setq isqlm-last-query sql)
   (let* ((parsed (isqlm--strip-terminator sql))
          (query (car parsed))
-         (vertical (cdr parsed))
+         (mode (cdr parsed))
+         (gset-p (and (listp mode) (eq (car mode) :gset)))
+         (gset-prefix (and gset-p (cadr mode)))
+         (vertical (and (not gset-p) (eq mode t)))
          (upper (upcase (string-trim-left query))))
     (when (string= query "")
       (error "Empty query"))
-    (cond
+    ;; \gset mode: execute and store results
+    (if gset-p
+        (let ((result (mysql-select isqlm-connection query nil 'full)))
+          (setq isqlm-last-result result)
+          (cond
+           ((null result)
+            (error "Query returned no results"))
+           ((/= (length (cdr result)) 1)
+            (error "\\gset requires exactly 1 row, got %d" (length (cdr result))))
+           (t
+            (let ((columns (car result))
+                  (row (cadr result)))
+              (dotimes (i (length columns))
+                (set (intern (concat gset-prefix (nth i columns)))
+                     (nth i row)))
+              ""))))
+      ;; Normal execution
+      (cond
      ;; SELECT-like queries
      ((or (string-prefix-p "SELECT" upper)
           (string-prefix-p "SHOW" upper)
@@ -785,6 +858,7 @@ Cells containing newlines are split across multiple display lines."
           (string-prefix-p "DESC " upper)
           (string-prefix-p "EXPLAIN" upper))
       (let ((result (mysql-select isqlm-connection query nil 'full)))
+        (setq isqlm-last-result result)
         (if (null result)
             (propertize "Empty set (0 rows)\n" 'font-lock-face 'isqlm-info-face)
           (let* ((columns (car result))
@@ -829,7 +903,7 @@ Cells containing newlines are split across multiple display lines."
              (format "Query OK, %d %s affected\n"
                      affected (if (= affected 1) "row" "rows"))
            "Query OK\n")
-         'font-lock-face 'isqlm-info-face))))))
+         'font-lock-face 'isqlm-info-face)))))))
 
 ;; ============================================================
 ;; Custom commands (\NAME dispatched to isqlm/NAME functions)
@@ -850,6 +924,7 @@ Cells containing newlines are split across multiple display lines."
     "  \\clear                                      — Clear buffer\n"
     "  \\history                                    — Show input history\n"
     "  \\echo TEXT...                                — Output text\n"
+    "  \\gset [PREFIX]                               — Store last result as variables\n"
     "  \\if CONDITION                                — Begin conditional block\n"
     "  \\elif CONDITION                              — Else-if branch\n"
     "  \\else                                        — Else branch\n"
@@ -860,7 +935,7 @@ Cells containing newlines are split across multiple display lines."
     "\n"
     "Aliases: \\? = \\h = \\help, \\q = \\quit, \\u = \\use\n"
     "\n"
-    "Or type any SQL statement ending with `;' or `\\G'.\n"
+    "Or type any SQL statement ending with `;', `\\G', or `\\gset [PREFIX]'.\n"
     "Press M-RET for a literal newline (multi-line input).\n"
     "\n"
     "\\CMD also works for Emacs Lisp functions, e.g. \\message hello\n"
@@ -1189,6 +1264,25 @@ CONDITION can be:
                              (format "%s" expanded))))
                        args)))
     (isqlm--output (concat (string-join parts " ") "\n"))))
+
+(defun isqlm/gset (&rest args)
+  "Store the last query result into Emacs variables (à la psql \\gset).
+Usage: first run a SELECT, then \\gset [PREFIX].
+The last query must have returned exactly one row."
+  (let ((prefix (or (car args) "")))
+    (cond
+     ((not isqlm-last-result)
+      (isqlm--output-error "No previous query result.  Run a SELECT first.\n"))
+     ((/= (length (cdr isqlm-last-result)) 1)
+      (isqlm--output-error
+       (format "\\gset requires exactly 1 row, got %d.\n"
+               (length (cdr isqlm-last-result)))))
+     (t
+      (let ((columns (car isqlm-last-result))
+            (row (cadr isqlm-last-result)))
+        (dotimes (i (length columns))
+          (set (intern (concat prefix (nth i columns)))
+               (nth i row))))))))
 
 ;; ============================================================
 ;; For loop (\for var in val1 val2 ... { body })

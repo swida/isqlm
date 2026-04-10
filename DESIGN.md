@@ -188,6 +188,7 @@ This expansion happens after statement splitting and before `isqlm--execute-sql`
 | `\elif` | `isqlm/elif` | Else-if branch |
 | `\else` | `isqlm/else` | Else branch |
 | `\endif` | `isqlm/endif` | End conditional block |
+| `\gset` | `isqlm/gset` | Store last query result as variables |
 | `\clear` | `isqlm/clear` | Clear buffer |
 | `\history` | `isqlm/history` | Show history |
 | `\quit`/`\exit` | `isqlm/quit` `isqlm/exit` | Quit |
@@ -263,6 +264,20 @@ Inspired by PostgreSQL's `psql` meta-commands. Uses a stack-based approach:
 | SELECT/SHOW/DESCRIBE/EXPLAIN | `mysql-select conn sql nil 'full` | Table or vertical formatting |
 | USE | `mysql-execute` | Update connection-info and mode-line |
 | Other (INSERT/UPDATE/DDL…) | `mysql-execute` | Display affected rows |
+
+### SQL Terminators
+
+| Terminator | Effect |
+|-----------|--------|
+| `;` | Normal execution |
+| `\G` | Vertical display (one field per line) |
+| `\gset [PREFIX]` | Execute query, store 1-row result as variables (no output) |
+
+`\gset` works in two modes:
+1. **As a SQL terminator**: `SELECT 1 AS x\gset` or `SELECT 1 AS x;\gset` — executes the query silently and stores results. Recognized by `isqlm--sql-complete-p`, `isqlm--split-statements`, and `isqlm--strip-terminator` (returns `(:gset PREFIX)` mode).
+2. **As a standalone command**: `\gset [PREFIX]` after a normal `SELECT ... ;` — uses the cached `isqlm-last-result` (saved by the preceding SELECT execution). Implemented by `isqlm/gset`.
+
+Both modes require exactly 1 row. Each column becomes an Emacs variable named `PREFIX` + column name.
 
 ### Multi-statement Splitting
 

@@ -155,6 +155,7 @@ All built-in commands are prefixed with `\`:
 | `\endif` | End conditional block |
 | `\eval EXPRESSION` | Evaluate Elisp expression |
 | `\for VAR in V1 V2 ... { body }` | Loop over values |
+| `\gset [PREFIX]` | Store last query result as variables |
 | `\help` | Show help |
 | `\quit` / `\exit` | Disconnect and kill buffer |
 
@@ -257,6 +258,39 @@ select * from t1 where a = :i;
 ```
 
 Body supports SQL statements (with `:varname` expansion) and `\` commands.
+
+### Storing Query Results (`\gset`)
+
+Like psql's `\gset`, store a single-row query result into Emacs variables.
+
+**As a SQL terminator** (no result displayed):
+
+```
+SQL> SELECT 'hello' AS var1, 10 AS var2\gset
+SQL> \echo :var1 :var2
+hello 10
+
+SQL> SELECT COUNT(*) AS cnt FROM users;\gset user_
+SQL> \echo :user_cnt
+42
+```
+
+**As a standalone command** (after executing a query):
+
+```
+SQL> SELECT * FROM t1 LIMIT 1;
++---+---+
+| a | b |
++---+---+
+| 1 | 1 |
++---+---+
+1 row in set
+SQL> \gset p
+SQL> \echo :pa :pb
+1 1
+```
+
+Each column becomes a variable named `PREFIX` + column name. The query must return exactly 1 row.
 
 ## Key Bindings
 
