@@ -3,7 +3,7 @@
 An Emacs major mode providing an interactive MySQL console, modeled after
 Eshell's architecture — **no external processes, no comint**. The mode manages
 its own buffer, markers, prompt, and I/O directly, communicating with MySQL
-through the [`mysql-el`](https://github.com/hadleywang/mysql-el) dynamic module (C FFI to libmysqlclient).
+through the [`mysql-el`](https://github.com/swida/mysql-el) dynamic module (C FFI to libmysqlclient).
 
 ## Features
 
