@@ -392,7 +392,7 @@ All options belong to the `isqlm` customize group:
 | `isqlm-prompt-continue` | `"  -> "` | Continuation prompt |
 | `isqlm-prompt-read-only` | `t` | Whether prompt is read-only |
 | `isqlm-noisy` | `t` | Beep on errors |
-| `isqlm-table-style` | `ascii` | Table border style (`ascii` / `unicode`) |
+| `isqlm-table-style` | `unicode` | Table border style (`ascii` / `unicode`) |
 | `isqlm-history-file-name` | `~/.emacs.d/isqlm-history` | History file |
 | `isqlm-history-size` | `512` | History capacity |
 | `isqlm-default-host` | `"127.0.0.1"` | Default host |

@@ -400,7 +400,7 @@ All options are in the `isqlm` customize group (`M-x customize-group RET isqlm`)
 |----------|---------|-------------|
 | `isqlm-prompt` | `"SQL> "` | Main prompt string |
 | `isqlm-prompt-continue` | `"  -> "` | Continuation prompt |
-| `isqlm-table-style` | `ascii` | Table borders: `ascii` or `unicode` |
+| `isqlm-table-style` | `unicode` | Table borders: `ascii` or `unicode` |
 | `isqlm-max-column-width` | `0` | Max column width (0 = auto/window width) |
 | `isqlm-max-rows` | `1000` | Max rows displayed (0 = unlimited) |
 | `isqlm-null-string` | `"NULL"` | Display string for NULL values |

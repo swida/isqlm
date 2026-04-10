@@ -87,7 +87,7 @@ When nil, an empty password is used (useful for passwordless local connections).
 up to the current window width minus table borders."
   :type 'integer :group 'isqlm)
 
-(defcustom isqlm-table-style 'ascii
+(defcustom isqlm-table-style 'unicode
   "Table border style for result display.
 `ascii'   — classic MySQL style using +, -, |
 `unicode' — box-drawing characters ┌┬┐├┼┤└┴┘│─"
