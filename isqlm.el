@@ -1180,37 +1180,47 @@ Handles built-in commands, complete SQL, and multi-statement input."
 
 (defun isqlm--execute-script (text)
   "Execute TEXT as a script — each line processed as if typed at the prompt.
-Multi-line SQL is accumulated until a terminator is found."
+Multi-line SQL is accumulated until a terminator is found.
+Respects \\if/\\elif/\\else/\\endif conditional flow."
   (let ((pending ""))
     (dolist (line (split-string text "\n"))
       (setq pending (concat pending
                             (if (string= pending "") "" "\n")
                             line))
-      (cond
-       ;; Built-in command on its own line (no multi-line pending)
-       ((and (not (string-match-p "\n" pending))
-             (string-prefix-p "\\" (string-trim pending)))
-        (isqlm--execute-line pending)
-        (setq pending ""))
-       ;; Complete SQL — execute
-       ((isqlm--sql-complete-p pending)
-        (let ((statements (isqlm--split-statements pending)))
-          (dolist (stmt statements)
-            (condition-case err
-                (let* ((expanded (isqlm--expand-sql-variables stmt))
-                       (result (isqlm--execute-sql expanded)))
-                  (isqlm--output result))
-              (error
-               (when isqlm-noisy (ding))
-               (isqlm--output-error
-                (format "*** Error *** %s\n"
-                        (isqlm--error-message err)))))))
-        (setq pending ""))))
+      (let ((trimmed (string-trim pending)))
+        (cond
+         ;; Built-in command on its own line (no multi-line pending)
+         ((and (not (string-match-p "\n" pending))
+               (string-prefix-p "\\" trimmed))
+          (cond
+           ;; Conditional flow commands — always process
+           ((isqlm--cond-flow-command-p trimmed)
+            (isqlm--process-cond-flow trimmed))
+           ;; Other commands — only when active
+           ((isqlm--cond-active-p)
+            (isqlm--execute-line pending)))
+          (setq pending ""))
+         ;; Complete SQL — execute only when active
+         ((isqlm--sql-complete-p pending)
+          (when (isqlm--cond-active-p)
+            (let ((statements (isqlm--split-statements pending)))
+              (dolist (stmt statements)
+                (condition-case err
+                    (let* ((expanded (isqlm--expand-sql-variables stmt))
+                           (result (isqlm--execute-sql expanded)))
+                      (isqlm--output result))
+                  (error
+                   (when isqlm-noisy (ding))
+                   (isqlm--output-error
+                    (format "*** Error *** %s\n"
+                            (isqlm--error-message err))))))))
+          (setq pending "")))))
     ;; Remaining unterminated input
     (when (> (length (string-trim pending)) 0)
-      (isqlm--output-error
-       (format "Unterminated statement at end of script: %s\n"
-               (string-trim pending))))))
+      (when (isqlm--cond-active-p)
+        (isqlm--output-error
+         (format "Unterminated statement at end of script: %s\n"
+                 (string-trim pending)))))))
 
 ;; Minor mode for \i - editing buffer
 (defvar-local isqlm--script-target nil
