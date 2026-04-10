@@ -156,6 +156,13 @@ Each element is a plist (:satisfied BOOL :active BOOL :depth-skip INT).
 :active    — whether the current branch should execute.
 :depth-skip — nested \\if depth to skip when inactive (0 when active).")
 
+(defvar-local isqlm-for-stack nil
+  "Stack for \\for loops.  Each element is a plist:
+:var      — variable name (symbol)
+:values   — list of remaining values to iterate
+:body     — list of body lines collected so far (in reverse)
+:brace    — whether we've seen the opening `{' yet")
+
 ;; ============================================================
 ;; Font-lock
 ;; ============================================================
@@ -836,6 +843,7 @@ Cells containing newlines are split across multiple display lines."
     "  \\elif CONDITION                              — Else-if branch\n"
     "  \\else                                        — Else branch\n"
     "  \\endif                                       — End conditional block\n"
+    "  \\for VAR in V1 V2 ... { body }               — Loop over values\n"
     "  \\help                                       — Show this help\n"
     "  \\quit / \\exit                               — Kill ISQLM buffer\n"
     "\n"
@@ -1170,6 +1178,141 @@ CONDITION can be:
                        args)))
     (isqlm--output (concat (string-join parts " ") "\n"))))
 
+;; ============================================================
+;; For loop (\for var in val1 val2 ... { body })
+;; ============================================================
+
+(defun isqlm--for-collecting-p ()
+  "Return non-nil if we are currently collecting for-loop body lines."
+  (and isqlm-for-stack (plist-get (car isqlm-for-stack) :brace)))
+
+(defun isqlm--for-start (input)
+  "Parse `\\for var in val1 val2 ...' and push a for-loop frame.
+INPUT is the full line.  Supports three forms:
+  \\for VAR in V1 V2 { body lines... }  — inline (single line)
+  \\for VAR in V1 V2 {                  — brace on same line, body follows
+  \\for VAR in V1 V2                    — brace expected on next line"
+  (let* ((trimmed (string-trim input))
+         ;; Extract everything after \for
+         (after-for (string-trim (substring trimmed (length "\\for"))))
+         ;; Find { and } positions in the raw string (outside quotes)
+         (brace-open (string-match "{" after-for))
+         (brace-close (and brace-open (string-match "}[[:space:]]*$" after-for))))
+    ;; Parse the header part (before {)
+    (let* ((header (if brace-open
+                       (substring after-for 0 brace-open)
+                     after-for))
+           (header-parts (isqlm--parse-command-line (string-trim header)))
+           (var-name (nth 0 header-parts))
+           (in-kw (nth 1 header-parts))
+           (values-raw (nthcdr 2 header-parts)))
+      (if (not (and var-name in-kw (string= (downcase in-kw) "in") values-raw))
+          (isqlm--output-error "Usage: \\for VAR in VAL1 VAL2 ... { body }\n")
+        (let ((values (mapcar (lambda (v)
+                                (let ((expanded (isqlm--expand-arg v)))
+                                  (if (stringp expanded) expanded
+                                    (format "%s" expanded))))
+                              values-raw)))
+          (cond
+           ;; Inline: { body } all on one line
+           ((and brace-open brace-close)
+            (let* ((body-str (string-trim
+                              (substring after-for (1+ brace-open)
+                                         (match-beginning 0))))
+                   (body-lines (split-string body-str ";" t "[ \t\n]+")))
+              ;; Re-add ; terminators for SQL lines
+              (setq body-lines
+                    (mapcar (lambda (l)
+                              (let ((s (string-trim l)))
+                                (if (and (> (length s) 0)
+                                         (not (string-prefix-p "\\" s))
+                                         (not (string-suffix-p ";" s))
+                                         (not (string-suffix-p "\\G" s)))
+                                    (concat s ";")
+                                  s)))
+                            body-lines))
+              (isqlm--for-execute-body (intern var-name) values body-lines)))
+           ;; Brace on same line, body follows on subsequent lines
+           (brace-open
+            (push (list :var (intern var-name)
+                        :values values
+                        :body nil
+                        :brace t
+                        :depth 0)
+                  isqlm-for-stack))
+           ;; No brace yet, expect { on next line
+           (t
+            (push (list :var (intern var-name)
+                        :values values
+                        :body nil
+                        :brace nil
+                        :depth 0)
+                  isqlm-for-stack))))))))
+
+(defun isqlm--for-collect-line (input)
+  "Collect INPUT as a body line for the current for-loop.
+Handle nested { } and detect the closing }."
+  (let* ((trimmed (string-trim input))
+         (frame (car isqlm-for-stack)))
+    (cond
+     ;; Opening { on its own line (first line after \for without {)
+     ((and (not (plist-get frame :brace))
+           (string= trimmed "{"))
+      (plist-put frame :brace t))
+     ;; Not yet seen opening brace — error
+     ((not (plist-get frame :brace))
+      (isqlm--output-error "Expected `{' after \\for\n")
+      (pop isqlm-for-stack))
+     ;; Closing } at depth 0 — execute
+     ((and (string= trimmed "}")
+           (= (plist-get frame :depth) 0))
+      (let ((var (plist-get frame :var))
+            (values (plist-get frame :values))
+            (body (nreverse (plist-get frame :body))))
+        (pop isqlm-for-stack)
+        (isqlm--for-execute-body var values body)))
+     ;; Nested { — track depth
+     ((string= trimmed "{")
+      (plist-put frame :depth (1+ (plist-get frame :depth)))
+      (plist-put frame :body (cons input (plist-get frame :body))))
+     ;; Nested } — track depth
+     ((string= trimmed "}")
+      (plist-put frame :depth (1- (plist-get frame :depth)))
+      (plist-put frame :body (cons input (plist-get frame :body))))
+     ;; Normal body line
+     (t
+      (plist-put frame :body (cons input (plist-get frame :body)))))))
+
+(defun isqlm--for-execute-body (var values body)
+  "Execute BODY lines for each value in VALUES, binding VAR.
+Each line is processed as if typed at the prompt."
+  (dolist (val values)
+    (set var val)
+    (dolist (line body)
+      (let ((trimmed (string-trim line)))
+        (when (> (length trimmed) 0)
+          (cond
+           ;; Built-in command
+           ((string-prefix-p "\\" trimmed)
+            (isqlm--try-builtin-command trimmed))
+           ;; SQL (may need terminator)
+           ((isqlm--sql-complete-p trimmed)
+            (let ((statements (isqlm--split-statements trimmed)))
+              (dolist (stmt statements)
+                (condition-case err
+                    (let* ((expanded (isqlm--expand-sql-variables stmt))
+                           (result (isqlm--execute-sql expanded)))
+                      (isqlm--output result))
+                  (error
+                   (when isqlm-noisy (ding))
+                   (isqlm--output-error
+                    (format "*** Error *** %s\n"
+                            (isqlm--error-message err))))))))
+           ;; Incomplete SQL — just output warning
+           (t
+            (isqlm--output-error
+             (format "Incomplete statement in \\for body: %s\n" trimmed)))))))))
+
 (defconst isqlm--cond-flow-commands '("if" "elif" "else" "endif")
   "List of conditional flow command names.")
 
@@ -1398,6 +1541,28 @@ Otherwise, insert a continuation prompt for multi-line input."
       (cond
        ;; Empty input
        ((string= (string-trim accumulated) "")
+        (setq isqlm-pending-input "")
+        (isqlm--emit-prompt))
+
+       ;; Collecting for-loop body lines
+       ((isqlm--for-collecting-p)
+        (isqlm--for-collect-line accumulated)
+        (setq isqlm-pending-input "")
+        (isqlm--emit-prompt))
+
+       ;; \for — start a new for-loop (may have { on same line)
+       ((and (string= isqlm-pending-input "")
+             (let ((first (car (split-string (string-trim accumulated) "[ \t]+" t))))
+               (and first (string-prefix-p "\\" first)
+                    (string= (downcase (substring first 1)) "for"))))
+        (isqlm--for-start accumulated)
+        (isqlm--add-to-history accumulated)
+        (setq isqlm-pending-input "")
+        (isqlm--emit-prompt))
+
+       ;; Waiting for opening { of a for-loop
+       ((and isqlm-for-stack (not (plist-get (car isqlm-for-stack) :brace)))
+        (isqlm--for-collect-line accumulated)
         (setq isqlm-pending-input "")
         (isqlm--emit-prompt))
 

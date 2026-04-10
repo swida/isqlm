@@ -173,6 +173,7 @@ This expansion happens after statement splitting and before `isqlm--execute-sql`
 | `\style` | `isqlm/style` | Toggle/set table border style |
 | `\eval` | `isqlm/eval` | Evaluate arbitrary Elisp expression |
 | `\echo` | `isqlm/echo` | Output text with variable expansion |
+| `\for` | `isqlm--for-start` | Loop over values with `{ body }` |
 | `\if` | `isqlm/if` | Begin conditional block |
 | `\elif` | `isqlm/elif` | Else-if branch |
 | `\else` | `isqlm/else` | Else branch |
@@ -221,6 +222,27 @@ Inspired by PostgreSQL's `psql` meta-commands. Uses a stack-based approach:
 - `(elisp-expr)` — true if the expression evaluates to non-nil
 - Falsy literals: `"0"`, `"false"`, `"no"`, `"nil"`, `""`, `"off"`
 - Everything else is truthy
+
+## 4.2 For Loops (`\for VAR in V1 V2 ... { body }`)
+
+**State**: `isqlm-for-stack` — a stack of plists, each with:
+- `:var` — loop variable symbol
+- `:values` — list of values to iterate
+- `:body` — collected body lines (in reverse during collection)
+- `:brace` — whether the opening `{` has been seen
+- `:depth` — nested `{}` depth counter
+
+**Three syntax forms**:
+1. **Inline**: `\for db in a b { \u :db; show tables; }` — parsed and executed immediately
+2. **Brace on same line**: `\for i in 1 2 3 {` — body collected on subsequent lines until `}`
+3. **Brace on next line**: `\for i in 1 2 3` → `{` → body → `}`
+
+**Processing in `isqlm-send-input`**:
+- `\for` detection pushes a frame onto `isqlm-for-stack`
+- While `isqlm--for-collecting-p` is true, all input lines are diverted to `isqlm--for-collect-line`
+- On `}`, `isqlm--for-execute-body` iterates: for each value, binds the variable with `set`, then processes each body line (dispatching `\` commands or executing SQL with variable expansion)
+
+**Inline parsing**: the body string between `{` and `}` is split on `;`. Non-command lines without terminators get `;` auto-appended.
 
 ## 5. SQL Execution Layer
 

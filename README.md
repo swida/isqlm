@@ -154,6 +154,7 @@ All built-in commands are prefixed with `\`:
 | `\else` | Else branch |
 | `\endif` | End conditional block |
 | `\eval EXPRESSION` | Evaluate Elisp expression |
+| `\for VAR in V1 V2 ... { body }` | Loop over values |
 | `\help` | Show help |
 | `\quit` / `\exit` | Disconnect and kill buffer |
 
@@ -230,6 +231,25 @@ Conditions can be:
 - `:varname` — true if the Emacs variable is bound and non-nil
 - `(elisp-expr)` — true if the expression evaluates to non-nil
 - Literal — true unless `"0"`, `"false"`, `"no"`, `"nil"`, or empty
+
+### For Loops
+
+Loop over a list of values:
+
+```
+SQL> \for db in test mtr { \u :db; show tables; }
+```
+
+Multi-line form:
+
+```
+SQL> \for i in 1 2 3
+{
+select * from t1 where a = :i;
+}
+```
+
+Body supports SQL statements (with `:varname` expansion) and `\` commands.
 
 ## Key Bindings
 
