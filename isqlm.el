@@ -1178,60 +1178,109 @@ Handles built-in commands, complete SQL, and multi-statement input."
         (isqlm--output-error
          (format "Incomplete statement: %s\n" trimmed)))))))
 
+(defun isqlm--execute-script (text)
+  "Execute TEXT as a script — each line processed as if typed at the prompt.
+Multi-line SQL is accumulated until a terminator is found."
+  (let ((pending ""))
+    (dolist (line (split-string text "\n"))
+      (setq pending (concat pending
+                            (if (string= pending "") "" "\n")
+                            line))
+      (cond
+       ;; Built-in command on its own line (no multi-line pending)
+       ((and (not (string-match-p "\n" pending))
+             (string-prefix-p "\\" (string-trim pending)))
+        (isqlm--execute-line pending)
+        (setq pending ""))
+       ;; Complete SQL — execute
+       ((isqlm--sql-complete-p pending)
+        (let ((statements (isqlm--split-statements pending)))
+          (dolist (stmt statements)
+            (condition-case err
+                (let* ((expanded (isqlm--expand-sql-variables stmt))
+                       (result (isqlm--execute-sql expanded)))
+                  (isqlm--output result))
+              (error
+               (when isqlm-noisy (ding))
+               (isqlm--output-error
+                (format "*** Error *** %s\n"
+                        (isqlm--error-message err)))))))
+        (setq pending ""))))
+    ;; Remaining unterminated input
+    (when (> (length (string-trim pending)) 0)
+      (isqlm--output-error
+       (format "Unterminated statement at end of script: %s\n"
+               (string-trim pending))))))
+
+;; Minor mode for \i - editing buffer
+(defvar-local isqlm--script-target nil
+  "The ISQLM buffer to send the script to when finished editing.")
+
+(defvar isqlm-script-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-c C-c") #'isqlm-script-finish)
+    (define-key map (kbd "C-c C-k") #'isqlm-script-abort)
+    map)
+  "Keymap for `isqlm-script-mode'.")
+
+(define-minor-mode isqlm-script-mode
+  "Minor mode for editing an ISQLM script.
+\\<isqlm-script-mode-map>
+\\[isqlm-script-finish] to execute the script.
+\\[isqlm-script-abort] to abort."
+  :lighter " ISQLM-Script"
+  :keymap isqlm-script-mode-map)
+
+(defun isqlm-script-finish ()
+  "Execute the script in this buffer and close it."
+  (interactive)
+  (let ((text (buffer-substring-no-properties (point-min) (point-max)))
+        (target isqlm--script-target)
+        (buf (current-buffer)))
+    (quit-window)
+    (kill-buffer buf)
+    (when (and target (buffer-live-p target))
+      (with-current-buffer target
+        (isqlm--execute-script text)
+        (isqlm--emit-prompt)))))
+
+(defun isqlm-script-abort ()
+  "Abort the script editing."
+  (interactive)
+  (let ((buf (current-buffer)))
+    (quit-window)
+    (kill-buffer buf)
+    (message "Script aborted.")))
+
 (defun isqlm/i (&rest args)
   "Read and execute SQL from a file (à la psql \\i / \\include).
-ARGS: FILENAME.  The file is read and each line is executed as if
-typed at the prompt.  Multi-line SQL statements (spanning lines
-without terminators) are accumulated until complete."
+ARGS: FILENAME.
+If FILENAME is `-', open a temporary buffer for script editing.
+Press C-c C-c to execute, C-c C-k to abort."
   (let ((filename (car args)))
-    (if (not filename)
-        (isqlm--output-error "Usage: \\i FILENAME\n")
-      ;; Expand ~ and resolve path
+    (cond
+     ((not filename)
+      (isqlm--output-error "Usage: \\i FILENAME  (use - for interactive script)\n"))
+     ;; Interactive mode: open editing buffer
+     ((string= filename "-")
+      (let ((target (current-buffer))
+            (buf (generate-new-buffer "*isqlm-script*")))
+        (pop-to-buffer buf)
+        (sql-mode)
+        (isqlm-script-mode 1)
+        (setq isqlm--script-target target)
+        (setq header-line-format
+              "Edit SQL script.  C-c C-c to execute, C-c C-k to abort.")
+        (message "Edit script, then C-c C-c to execute or C-c C-k to abort.")))
+     ;; File mode
+     (t
       (let ((path (expand-file-name filename)))
         (if (not (file-readable-p path))
             (isqlm--output-error (format "Cannot read file: %s\n" path))
-          (isqlm--output-info (format "Executing: %s\n" path))
-          (let ((pending ""))
-            (with-temp-buffer
-              (insert-file-contents path)
-              (goto-char (point-min))
-              (while (not (eobp))
-                (let ((line (buffer-substring-no-properties
-                             (line-beginning-position) (line-end-position))))
-                  (setq pending (concat pending
-                                        (if (string= pending "") "" "\n")
-                                        line))
-                  (cond
-                   ;; Built-in command on its own line (no pending SQL)
-                   ((and (string= (string-trim
-                                   (concat "" (if (string-match "\n" pending)
-                                                   ""
-                                                 pending)))
-                                  (string-trim line))
-                         (string-prefix-p "\\" (string-trim pending))
-                         (not (string-match "\n" pending)))
-                    (isqlm--execute-line pending)
-                    (setq pending ""))
-                   ;; Complete SQL — execute
-                   ((isqlm--sql-complete-p pending)
-                    (let ((statements (isqlm--split-statements pending)))
-                      (dolist (stmt statements)
-                        (condition-case err
-                            (let* ((expanded (isqlm--expand-sql-variables stmt))
-                                   (result (isqlm--execute-sql expanded)))
-                              (isqlm--output result))
-                          (error
-                           (when isqlm-noisy (ding))
-                           (isqlm--output-error
-                            (format "*** Error *** %s\n"
-                                    (isqlm--error-message err)))))))
-                    (setq pending ""))))
-                (forward-line 1)))
-            ;; Handle any remaining incomplete input
-            (when (> (length (string-trim pending)) 0)
-              (isqlm--output-error
-               (format "Unterminated statement at end of file: %s\n"
-                       (string-trim pending))))))))))
+          (isqlm--execute-script
+           (with-temp-buffer
+             (insert-file-contents path)
+             (buffer-string)))))))))
 
 (defalias 'isqlm/include #'isqlm/i
   "Alias for `isqlm/i'.  Read and execute SQL from a file.")
@@ -1780,9 +1829,10 @@ Otherwise, insert a continuation prompt for multi-line input."
        ((and (string= isqlm-pending-input "")
              (isqlm--try-builtin-command accumulated))
         (when (buffer-live-p isqlm-buf)
-          (isqlm--add-to-history accumulated)
-          (setq isqlm-pending-input "")
-          (isqlm--emit-prompt)))
+          (with-current-buffer isqlm-buf
+            (isqlm--add-to-history accumulated)
+            (setq isqlm-pending-input "")
+            (isqlm--emit-prompt))))
 
        ;; Incomplete SQL (no terminator yet)
        ((not (isqlm--sql-complete-p accumulated))

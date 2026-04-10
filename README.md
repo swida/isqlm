@@ -156,7 +156,7 @@ All built-in commands are prefixed with `\`:
 | `\eval EXPRESSION` | Evaluate Elisp expression |
 | `\for VAR in V1 V2 ... { body }` | Loop over values |
 | `\gset [PREFIX]` | Store last query result as variables |
-| `\i FILENAME` / `\include FILENAME` | Execute SQL from file |
+| `\i FILE` / `\include FILE` | Execute SQL from file (`-` for interactive editor) |
 | `\help` | Show help |
 | `\quit` / `\exit` | Disconnect and kill buffer |
 
@@ -292,6 +292,18 @@ SQL> \echo :pa :pb
 ```
 
 Each column becomes a variable named `PREFIX` + column name. The query must return exactly 1 row.
+
+### Script Editing (`\i -`)
+
+Use `\i -` to open an interactive script editor:
+
+```
+SQL> \i -
+```
+
+A `*isqlm-script*` buffer opens with `sql-mode` syntax highlighting. Write your script, then:
+- `C-c C-c` — execute the script and return to ISQLM
+- `C-c C-k` — abort without executing
 
 ## Key Bindings
 

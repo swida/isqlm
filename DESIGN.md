@@ -189,7 +189,7 @@ This expansion happens after statement splitting and before `isqlm--execute-sql`
 | `\else` | `isqlm/else` | Else branch |
 | `\endif` | `isqlm/endif` | End conditional block |
 | `\gset` | `isqlm/gset` | Store last query result as variables |
-| `\i`/`\include` | `isqlm/i` | Execute SQL from file |
+| `\i`/`\include` | `isqlm/i` | Execute SQL from file (`-` for script editor) |
 | `\clear` | `isqlm/clear` | Clear buffer |
 | `\history` | `isqlm/history` | Show history |
 | `\quit`/`\exit` | `isqlm/quit` `isqlm/exit` | Quit |
@@ -279,6 +279,12 @@ Inspired by PostgreSQL's `psql` meta-commands. Uses a stack-based approach:
 2. **As a standalone command**: `\gset [PREFIX]` after a normal `SELECT ... ;` — uses the cached `isqlm-last-result` (saved by the preceding SELECT execution). Implemented by `isqlm/gset`.
 
 Both modes require exactly 1 row. Each column becomes an Emacs variable named `PREFIX` + column name.
+
+### Script Execution (`\i` / `\include`)
+
+- **File mode** (`\i FILE`): reads file contents and passes to `isqlm--execute-script`
+- **Interactive mode** (`\i -`): opens `*isqlm-script*` buffer with `sql-mode` + `isqlm-script-mode` minor mode. `C-c C-c` executes via `isqlm--execute-script`, `C-c C-k` aborts
+- `isqlm--execute-script`: shared function that processes text line by line, accumulating multi-line SQL until a terminator is found, dispatching `\` commands immediately
 
 ### Multi-statement Splitting
 
