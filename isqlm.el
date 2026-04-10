@@ -1191,28 +1191,43 @@ CONDITION can be:
 INPUT is the full line.  Supports three forms:
   \\for VAR in V1 V2 { body lines... }  — inline (single line)
   \\for VAR in V1 V2 {                  — brace on same line, body follows
-  \\for VAR in V1 V2                    — brace expected on next line"
+  \\for VAR in V1 V2                    — brace expected on next line
+Values can also be an Elisp expression: \\for i in (number-sequence 1 10) { ... }"
   (let* ((trimmed (string-trim input))
-         ;; Extract everything after \for
          (after-for (string-trim (substring trimmed (length "\\for"))))
-         ;; Find { and } positions in the raw string (outside quotes)
          (brace-open (string-match "{" after-for))
-         (brace-close (and brace-open (string-match "}[[:space:]]*$" after-for))))
-    ;; Parse the header part (before {)
-    (let* ((header (if brace-open
-                       (substring after-for 0 brace-open)
-                     after-for))
-           (header-parts (isqlm--parse-command-line (string-trim header)))
-           (var-name (nth 0 header-parts))
-           (in-kw (nth 1 header-parts))
-           (values-raw (nthcdr 2 header-parts)))
-      (if (not (and var-name in-kw (string= (downcase in-kw) "in") values-raw))
-          (isqlm--output-error "Usage: \\for VAR in VAL1 VAL2 ... { body }\n")
-        (let ((values (mapcar (lambda (v)
-                                (let ((expanded (isqlm--expand-arg v)))
-                                  (if (stringp expanded) expanded
-                                    (format "%s" expanded))))
-                              values-raw)))
+         (brace-close (and brace-open (string-match "}[[:space:]]*$" after-for)))
+         (header (string-trim (if brace-open
+                                  (substring after-for 0 brace-open)
+                                after-for)))
+         (header-parts (isqlm--parse-command-line header))
+         (var-name (nth 0 header-parts))
+         (in-kw (nth 1 header-parts))
+         (values-raw (nthcdr 2 header-parts)))
+    (if (not (and var-name in-kw (string= (downcase in-kw) "in") values-raw))
+        (isqlm--output-error "Usage: \\for VAR in VAL1 VAL2 ... { body }\n")
+      ;; Resolve values
+      (let* ((values-str (string-trim
+                          (substring header
+                                     (+ (length var-name) 1 (length in-kw) 1))))
+             (values
+              (if (string-prefix-p "(" values-str)
+                  (condition-case err
+                      (let ((result (eval (read values-str) t)))
+                        (mapcar (lambda (v)
+                                  (if (stringp v) v (format "%s" v)))
+                                (if (listp result) result (list result))))
+                    (error
+                     (isqlm--output-error
+                      (format "*** Eval Error in \\for values *** %s\n"
+                              (isqlm--error-message err)))
+                     nil))
+                (mapcar (lambda (v)
+                          (let ((expanded (isqlm--expand-arg v)))
+                            (if (stringp expanded) expanded
+                              (format "%s" expanded))))
+                        values-raw))))
+        (when values
           (cond
            ;; Inline: { body } all on one line
            ((and brace-open brace-close)
@@ -1220,7 +1235,6 @@ INPUT is the full line.  Supports three forms:
                               (substring after-for (1+ brace-open)
                                          (match-beginning 0))))
                    (body-lines (split-string body-str ";" t "[ \t\n]+")))
-              ;; Re-add ; terminators for SQL lines
               (setq body-lines
                     (mapcar (lambda (l)
                               (let ((s (string-trim l)))
@@ -1248,7 +1262,6 @@ INPUT is the full line.  Supports three forms:
                         :brace nil
                         :depth 0)
                   isqlm-for-stack))))))))
-
 (defun isqlm--for-collect-line (input)
   "Collect INPUT as a body line for the current for-loop.
 Handle nested { } and detect the closing }."
