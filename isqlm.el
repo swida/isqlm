@@ -485,15 +485,18 @@ backtick identifiers, and comments.  Variable values are formatted as:
            ((= ch ?#) (setq in-lc t) (push ch result))
            ((and (= ch ?/) (< (1+ i) len) (= (aref sql (1+ i)) ?*))
             (setq in-bc t) (push ch result) (push ?* result) (cl-incf i))
-           ;; :varname — expand if followed by word chars
+           ;; ::varname — raw expansion (no quoting, for identifiers)
+           ;; :varname  — value expansion (strings quoted)
            ((and (= ch ?:)
                  (< (1+ i) len)
                  (let ((nc (aref sql (1+ i))))
                    (or (and (>= nc ?a) (<= nc ?z))
                        (and (>= nc ?A) (<= nc ?Z))
-                       (= nc ?_))))
-            (let ((start (1+ i))
-                  (j (1+ i)))
+                       (= nc ?_)
+                       (= nc ?:))))  ; :: prefix
+            (let* ((raw-p (and (< (1+ i) len) (= (aref sql (1+ i)) ?:)))
+                   (start (if raw-p (+ i 2) (1+ i)))
+                   (j start))
               (while (and (< j len)
                           (let ((c (aref sql j)))
                             (or (and (>= c ?a) (<= c ?z))
@@ -505,18 +508,26 @@ backtick identifiers, and comments.  Variable values are formatted as:
                      (sym (intern-soft name))
                      (val (if (and sym (boundp sym))
                               (symbol-value sym)
-                            (user-error "Void variable in SQL: :%s" name)))
+                            (user-error "Void variable in SQL: %s%s"
+                                        (if raw-p "::" ":") name)))
                      (replacement
-                      (cond
-                       ((null val) "NULL")
-                       ((integerp val) (number-to-string val))
-                       ((floatp val) (format "%g" val))
-                       ((stringp val)
-                        (concat "'" (replace-regexp-in-string "'" "''" val) "'"))
-                       (t (concat "'"
-                                  (replace-regexp-in-string
-                                   "'" "''" (format "%s" val))
-                                  "'")))))
+                      (if raw-p
+                          ;; Raw: no quoting
+                          (cond
+                           ((null val) "NULL")
+                           ((stringp val) val)
+                           (t (format "%s" val)))
+                        ;; Value: strings get quoted
+                        (cond
+                         ((null val) "NULL")
+                         ((integerp val) (number-to-string val))
+                         ((floatp val) (format "%g" val))
+                         ((stringp val)
+                          (concat "'" (replace-regexp-in-string "'" "''" val) "'"))
+                         (t (concat "'"
+                                    (replace-regexp-in-string
+                                     "'" "''" (format "%s" val))
+                                    "'"))))))
                 (dolist (c (append replacement nil))
                   (push c result))
                 (setq i (1- j)))))
@@ -854,6 +865,7 @@ Cells containing newlines are split across multiple display lines."
     "\n"
     "\\CMD also works for Emacs Lisp functions, e.g. \\message hello\n"
     "Use :varname to reference Emacs variables, e.g. \\message :user-login-name\n"
+    "In SQL: :var = quoted value, ::var = raw text (for identifiers)\n"
     "Use \\setq to set variables, e.g. \\setq myvar \"hello world\"\n"
     "Use \\eval to run Elisp, e.g. \\eval (+ 1 2)\n")))
 

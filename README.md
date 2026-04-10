@@ -186,7 +186,10 @@ SQL> \message :user-login-name
 hadleywang
 ```
 
-Variables are also expanded in SQL statements (`:varname` syntax):
+Variables are also expanded in SQL statements:
+
+- `:varname` — **value** expansion (strings are single-quoted)
+- `::varname` — **raw** expansion (no quoting, for identifiers like table/column names)
 
 ```
 SQL> \setq cid 123
@@ -196,6 +199,10 @@ SQL> SELECT * FROM customer WHERE customer_id = :cid;
 SQL> \setq name "O'Brien"
 SQL> SELECT * FROM users WHERE name = :name;
 -- expands to: SELECT * FROM users WHERE name = 'O''Brien';
+
+SQL> \setq tbl "users"
+SQL> SELECT * FROM ::tbl WHERE id = 1;
+-- expands to: SELECT * FROM users WHERE id = 1;
 ```
 
 Expansion rules: strings → `'quoted'`, numbers → literal, nil → `NULL`.
