@@ -284,19 +284,65 @@ Plist with keys:
 ;; Error message extraction
 ;; ============================================================
 
+;; mysql-el signals `mysql-error' with structured data: (ERRNO SQLSTATE ERRMSG).
+;; In a `condition-case' handler, ERR is (mysql-error ERRNO SQLSTATE ERRMSG).
+;; For generic `error' signals, ERR is (error . "message") or (error FORMAT ARGS...).
+
+(defun isqlm--mysql-error-p (err)
+  "Return non-nil if ERR is a `mysql-error' signal."
+  (eq (car err) 'mysql-error))
+
+(defun isqlm--mysql-error-errno (err)
+  "Extract the MySQL error code (integer) from a `mysql-error' ERR."
+  (nth 1 err))
+
+(defun isqlm--mysql-error-sqlstate (err)
+  "Extract the SQLSTATE string from a `mysql-error' ERR."
+  (nth 2 err))
+
+(defun isqlm--mysql-error-errmsg (err)
+  "Extract the error message string from a `mysql-error' ERR."
+  (nth 3 err))
+
 (defun isqlm--error-message (err)
   "Extract a human-readable error message from ERR.
-ERR is the value bound by `condition-case'.  mysql-el signals errors
-as (error . \"message-string\") where the cdr is a plain string rather
-than the usual (format-string . args) list, which causes
-`error-message-string' to return \"peculiar error\".  This function
-handles both formats."
-  (let ((data (cdr err)))
-    (cond
-     ((stringp data) data)
-     ((and (consp data) (stringp (car data)))
-      (apply #'format (car data) (cdr data)))
-     (t (error-message-string err)))))
+For `mysql-error' signals, format as \"ERROR <errno> (<sqlstate>): <msg>\".
+For generic `error' signals, extract the message string."
+  (if (isqlm--mysql-error-p err)
+      (format "ERROR %d (%s): %s"
+              (isqlm--mysql-error-errno err)
+              (isqlm--mysql-error-sqlstate err)
+              (isqlm--mysql-error-errmsg err))
+    (let ((data (cdr err)))
+      (cond
+       ((stringp data) data)
+       ((and (consp data) (stringp (car data)))
+        (apply #'format (car data) (cdr data)))
+       (t (error-message-string err))))))
+
+(defun isqlm--output-mysql-error (&optional err)
+  "Output a MySQL error in mysql-client format.
+If ERR is a `mysql-error' signal, format its structured data as
+\"ERROR <errno> (<sqlstate>): <message>\".  If ERR is a generic
+`error' signal, output as \"*** Error *** <message>\".
+If ERR is nil, output \"*** Error *** Unknown error\"."
+  (if err
+      (isqlm--output-error
+       (concat (isqlm--error-message err) "\n"))
+    (isqlm--output-error "*** Error *** Unknown error\n")))
+
+(defun isqlm--warning-count-string ()
+  "Return a string like \", 2 warnings\" if there are warnings, else \"\"."
+  (if (and isqlm-connection
+           (condition-case nil (mysqlp isqlm-connection) (error nil))
+           (fboundp 'mysql-warning-count))
+      (let ((wc (condition-case nil
+                    (mysql-warning-count isqlm-connection)
+                  (error 0))))
+        (if (and (integerp wc) (> wc 0))
+            (format ", %d %s" wc (if (= wc 1) "warning" "warnings"))
+          ""))
+    ""))
 
 ;; ============================================================
 ;; Connection helpers
@@ -966,7 +1012,8 @@ Returns formatted output string."
       (let ((result (mysql-select isqlm-connection query nil 'full)))
         (setq isqlm-last-result result)
         (if (null result)
-            (propertize "Empty set (0 rows)\n" 'font-lock-face 'isqlm-info-face)
+            (propertize (format "Empty set (0 rows)%s\n" (isqlm--warning-count-string))
+                        'font-lock-face 'isqlm-info-face)
           (let* ((columns (car result))
                  (rows (cdr result))
                  (nrows (length rows))
@@ -985,12 +1032,13 @@ Returns formatted output string."
                     rows ""))
                (isqlm--format-table columns rows))
              (propertize
-              (if truncated
-                  (format "%d rows in set (truncated from %d)\n" (length rows) nrows)
-                (format "%d %s in set\n" nrows (if (= nrows 1) "row" "rows")))
+              (let ((ws (isqlm--warning-count-string)))
+                (if truncated
+                    (format "%d rows in set%s (truncated from %d)\n" (length rows) ws nrows)
+                  (format "%d %s in set%s\n" nrows (if (= nrows 1) "row" "rows") ws)))
               'font-lock-face 'isqlm-info-face))))))
-     ;; USE
-     ((string-prefix-p "USE" upper)
+    ;; USE
+    ((string-prefix-p "USE" upper)
       (mysql-execute isqlm-connection query)
       (let ((db-name (string-trim
                       (replace-regexp-in-string "\\`USE\\s-+" "" query))))
@@ -1005,10 +1053,11 @@ Returns formatted output string."
      (t
       (let ((affected (mysql-execute isqlm-connection query)))
         (propertize
-         (if (integerp affected)
-             (format "Query OK, %d %s affected\n"
-                     affected (if (= affected 1) "row" "rows"))
-           "Query OK\n")
+         (let ((ws (isqlm--warning-count-string)))
+           (if (and (integerp affected) (>= affected 0))
+               (format "Query OK, %d %s affected%s\n"
+                       affected (if (= affected 1) "row" "rows") ws)
+             (format "Query OK%s\n" ws)))
          'font-lock-face 'isqlm-info-face)))))))
 
 ;; ============================================================
@@ -1063,8 +1112,7 @@ CALLBACK is called (with no args) when this statement completes."
               (isqlm--output (isqlm--execute-sql-1 sql))
             (error
              (when isqlm-noisy (ding))
-             (isqlm--output-error
-              (format "*** Error *** %s\n" (isqlm--error-message err)))))
+             (isqlm--output-mysql-error err)))
           (funcall callback)
           (throw 'done nil))
         ;; Start async query
@@ -1097,12 +1145,10 @@ CALLBACK is called (with no args) when this statement completes."
                    (isqlm--output (isqlm--execute-sql-1 sql))
                  (error
                   (when isqlm-noisy (ding))
-                  (isqlm--output-error
-                   (format "*** Error *** %s\n" (isqlm--error-message err2)))))
+                  (isqlm--output-mysql-error err2)))
                (funcall callback))
            (when isqlm-noisy (ding))
-           (isqlm--output-error
-            (format "*** Error *** %s\n" (isqlm--error-message err)))
+           (isqlm--output-mysql-error err)
            (funcall callback))))))))
 (defun isqlm--async-poll-query (buffer)
   "Timer callback: poll query phase progress."
@@ -1128,7 +1174,7 @@ CALLBACK is called (with no args) when this statement completes."
                       (callback (plist-get isqlm--async-state :callback)))
                   (when timer (cancel-timer timer))
                   (setq isqlm--async-state nil)
-                  (isqlm--output-error "*** Error *** async query failed\n")
+                  (isqlm--output-mysql-error)
                   (when callback (funcall callback))))))
           (error
            (let ((timer (plist-get isqlm--async-state :timer))
@@ -1137,8 +1183,7 @@ CALLBACK is called (with no args) when this statement completes."
              (setq isqlm--async-state nil)
              (setq isqlm--async-busy nil)
              (when isqlm-noisy (ding))
-             (isqlm--output-error
-              (format "*** Error *** %s\n" (isqlm--error-message err)))
+             (isqlm--output-mysql-error err)
              (when callback (funcall callback)))))))))
 
 (defun isqlm--async-store-result (buffer query mode callback)
@@ -1162,13 +1207,11 @@ CALLBACK is called (with no args) when this statement completes."
                                   0.02 0.02
                                   #'isqlm--async-poll-store buffer))))
              (t
-              (isqlm--output-error
-               "*** Error *** async store-result failed\n")
+              (isqlm--output-mysql-error)
               (funcall callback)))))
       (error
        (when isqlm-noisy (ding))
-       (isqlm--output-error
-        (format "*** Error *** %s\n" (isqlm--error-message err)))
+       (isqlm--output-mysql-error err)
        (funcall callback)))))
 
 (defun isqlm--async-poll-store (buffer)
@@ -1197,8 +1240,7 @@ CALLBACK is called (with no args) when this statement completes."
                       (callback (plist-get isqlm--async-state :callback)))
                   (when timer (cancel-timer timer))
                   (setq isqlm--async-state nil)
-                  (isqlm--output-error
-                   "*** Error *** async store-result failed\n")
+                  (isqlm--output-mysql-error)
                   (when callback (funcall callback))))))
           (error
            (let ((timer (plist-get isqlm--async-state :timer))
@@ -1207,8 +1249,7 @@ CALLBACK is called (with no args) when this statement completes."
              (setq isqlm--async-state nil)
              (setq isqlm--async-busy nil)
              (when isqlm-noisy (ding))
-             (isqlm--output-error
-              (format "*** Error *** %s\n" (isqlm--error-message err)))
+             (isqlm--output-mysql-error err)
              (when callback (funcall callback)))))))))
 
 (defun isqlm--async-process-result (buffer query mode res-ptr)
@@ -1220,7 +1261,7 @@ RES-PTR is the MYSQL_RES user-ptr (or nil for non-SELECT)."
            (vertical (and (not gset-p) (eq mode t)))
            (upper (upcase (string-trim-left query))))
       (cond
-       ;; SELECT-like query
+       ;; SELECT-like query with result set
        ((and res-ptr
              (or (string-prefix-p "SELECT" upper)
                  (string-prefix-p "SHOW" upper)
@@ -1248,7 +1289,7 @@ RES-PTR is the MYSQL_RES user-ptr (or nil for non-SELECT)."
             ;; Normal SELECT display
             (if (null result)
                 (isqlm--output
-                 (propertize "Empty set (0 rows)\n"
+                 (propertize (format "Empty set (0 rows)%s\n" (isqlm--warning-count-string))
                              'font-lock-face 'isqlm-info-face))
               (let* ((columns (car result))
                      (rows (cdr result))
@@ -1269,10 +1310,34 @@ RES-PTR is the MYSQL_RES user-ptr (or nil for non-SELECT)."
                          rows ""))
                     (isqlm--format-table columns rows))
                   (propertize
-                   (if truncated
-                       (format "%d rows in set (truncated from %d)\n" (length rows) nrows)
-                     (format "%d %s in set\n" nrows (if (= nrows 1) "row" "rows")))
+                   (let ((ws (isqlm--warning-count-string)))
+                     (if truncated
+                         (format "%d rows in set%s (truncated from %d)\n" (length rows) ws nrows)
+                       (format "%d %s in set%s\n" nrows (if (= nrows 1) "row" "rows") ws)))
                    'font-lock-face 'isqlm-info-face))))))))
+      ;; SELECT-like query but no result set — query error
+       ;; (Safety net: C layer should have signaled an error already,
+       ;; but handle the case defensively.)
+       ((and (not res-ptr)
+             (or (string-prefix-p "SELECT" upper)
+                 (string-prefix-p "SHOW" upper)
+                 (string-prefix-p "DESCRIBE" upper)
+                 (string-prefix-p "DESC " upper)
+                 (string-prefix-p "EXPLAIN" upper)))
+        (let ((field-count (mysql-async-field-count isqlm-connection)))
+          (if (and (integerp field-count) (> field-count 0))
+              ;; Expected a result set but got none — an error occurred
+              (isqlm--output-mysql-error)
+            ;; field-count is 0 — somehow not a SELECT after all
+            (let ((affected (mysql-async-affected-rows isqlm-connection)))
+              (isqlm--output
+               (propertize
+                (let ((ws (isqlm--warning-count-string)))
+                  (if (and (integerp affected) (>= affected 0))
+                      (format "Query OK, %d %s affected%s\n"
+                              affected (if (= affected 1) "row" "rows") ws)
+                    (format "Query OK%s\n" ws)))
+                'font-lock-face 'isqlm-info-face))))))
        ;; Non-SELECT (DML/DDL)
        (t
         ;; Free the res-ptr if it exists but was not a SELECT
@@ -1283,10 +1348,11 @@ RES-PTR is the MYSQL_RES user-ptr (or nil for non-SELECT)."
         (let ((affected (mysql-async-affected-rows isqlm-connection)))
           (isqlm--output
            (propertize
-            (if (integerp affected)
-                (format "Query OK, %d %s affected\n"
-                        affected (if (= affected 1) "row" "rows"))
-              "Query OK\n")
+            (let ((ws (isqlm--warning-count-string)))
+              (if (and (integerp affected) (>= affected 0))
+                  (format "Query OK, %d %s affected%s\n"
+                          affected (if (= affected 1) "row" "rows") ws)
+                (format "Query OK%s\n" ws)))
             'font-lock-face 'isqlm-info-face))))))))
 
 (defun isqlm--async-cancel ()
@@ -1446,8 +1512,7 @@ HOST, USER, PASSWORD, DATABASE, PORT are connection parameters."
                    (isqlm--format-connection-info) ver)))
         (setq isqlm-pending-input ""))
     (error
-     (isqlm--output-error
-      (format "*** Connection Error *** %s\n" (isqlm--error-message err))))))
+     (isqlm--output-mysql-error err))))
 
 (defun isqlm/password (&rest _args)
   "Toggle whether \\connect prompts for a password.
@@ -1499,8 +1564,7 @@ When disabled, empty password is used."
             (force-mode-line-update)
             (isqlm--output-info (format "Database changed to: %s\n" db)))
         (error
-         (isqlm--output-error
-          (format "*** Error *** %s\n" (isqlm--error-message err)))))))))
+         (isqlm--output-mysql-error err)))))))
 
 (defun isqlm/status (&rest _args)
   "Show connection status and configuration."
@@ -1576,9 +1640,7 @@ Handles built-in commands, complete SQL, and multi-statement input."
                   (isqlm--output result))
               (error
                (when isqlm-noisy (ding))
-               (isqlm--output-error
-                (format "*** Error *** %s\n"
-                        (isqlm--error-message err))))))))
+               (isqlm--output-mysql-error err))))))
        ;; Incomplete SQL — warning
        (t
         (isqlm--output-error
@@ -1617,9 +1679,7 @@ Respects \\if/\\elif/\\else/\\endif conditional flow."
                       (isqlm--output result))
                   (error
                    (when isqlm-noisy (ding))
-                   (isqlm--output-error
-                    (format "*** Error *** %s\n"
-                            (isqlm--error-message err))))))))
+                   (isqlm--output-mysql-error err))))))
           (setq pending "")))))
     ;; Remaining unterminated input
     (when (> (length (string-trim pending)) 0)
@@ -2297,8 +2357,7 @@ Otherwise, insert a continuation prompt for multi-line input."
                     (isqlm--output result))
                 (error
                  (when isqlm-noisy (ding))
-                 (isqlm--output-error
-                  (format "*** Error *** %s\n" (isqlm--error-message err))))))
+                 (isqlm--output-mysql-error err))))
             (isqlm--emit-prompt))))))))))
 
 ;; ============================================================
@@ -2380,8 +2439,7 @@ If an async query is in progress, cancel it."
   (condition-case err
       (isqlm--output (isqlm--execute-sql sql))
     (error
-     (isqlm--output-error
-      (format "*** Error *** %s\n" (isqlm--error-message err)))))
+     (isqlm--output-mysql-error err)))
   (isqlm--emit-prompt))
 
 ;; ============================================================

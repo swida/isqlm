@@ -27,7 +27,8 @@ through the [`mysql-el`](https://github.com/swida/mysql-el) dynamic module (C FF
 - **Command aliases** — extensible shorthand mappings (`\?` = `\help`, etc.)
 - **Elisp function dispatch** — `\CMD` falls back to Emacs Lisp functions (à la Eshell)
 - **Variable references** — use `:varname` in command args to reference Emacs variables
-- **Improved error messages** — correctly extracts MySQL error details from `mysql-el`
+- **MySQL-client error format** — errors display as `ERROR 1690 (22003): BIGINT value is out of range...` (same as the `mysql` CLI), with structured error data from `mysql-el`'s `mysql-error` signal
+- **Warning count display** — query results show warnings like `1 row in set, 2 warnings`
 
 ## Requirements
 

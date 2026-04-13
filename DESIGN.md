@@ -324,6 +324,7 @@ User presses RET
 | `mysql-async-result` | `(db res &optional full)` → list | Convert stored result to Elisp list (no I/O) |
 | `mysql-async-affected-rows` | `(db)` → integer | Affected row count after non-SELECT |
 | `mysql-async-field-count` | `(db)` → integer | Field count (0 = not SELECT) |
+| `mysql-warning-count` | `(db)` → integer | Warning count from last statement |
 | Other (INSERT/UPDATE/DDL…) | `mysql-execute` | Display affected rows |
 
 ### SQL Terminators
@@ -356,9 +357,26 @@ Both modes require exactly 1 row. Each column becomes an Emacs variable named `P
 
 Each complete statement (including its terminator) is returned as a list element.
 
-### Error Message Extraction
+### Error Handling
 
-`mysql-el` signals errors via `env->non_local_exit_signal(env, 'error, "string")` where data is a plain string, not the usual `(format-string . args)` list. This causes Emacs's `error-message-string` to return `"peculiar error"`. The function `isqlm--error-message` handles this by checking if `(cdr err)` is a string and returning it directly.
+`mysql-el` signals a dedicated `mysql-error` error symbol (inheriting from `error`) with structured data: `(mysql-error ERRNO SQLSTATE ERRMSG)`. This is modeled after Emacs's built-in `sqlite-error`.
+
+In a `condition-case` handler, `err` is `(mysql-error 1690 "22003" "BIGINT value is out of range...")`.
+
+**Elisp accessors** (in `isqlm.el`):
+
+| Function | Returns |
+|----------|---------|
+| `isqlm--mysql-error-p` | Non-nil if ERR is a `mysql-error` signal |
+| `isqlm--mysql-error-errno` | Integer error code (e.g. `1690`) |
+| `isqlm--mysql-error-sqlstate` | SQLSTATE string (e.g. `"22003"`) |
+| `isqlm--mysql-error-errmsg` | Error message string |
+
+**`isqlm--error-message`**: For `mysql-error` signals, formats as `"ERROR 1690 (22003): BIGINT value is out of range..."` (MySQL CLI style). For generic `error` signals, extracts the message string as before.
+
+**`isqlm--output-mysql-error`**: Outputs the error using `isqlm--error-message`. No longer needs to re-query the connection handle (which could have been reset).
+
+**Warning count**: `mysql-el` exposes `mysql-warning-count` (wrapping `mysql_warning_count()`). The helper `isqlm--warning-count-string` returns `", 2 warnings"` or `""`. This is appended to all result summary lines (`N rows in set`, `Empty set`, `Query OK, N rows affected`).
 
 ### mysql-el API Summary
 
@@ -368,9 +386,13 @@ Each complete statement (including its terminator) is returned as a list element
 | `mysql-close` | `(conn)` | nil |
 | `mysql-select` | `(conn sql &optional types full)` | full mode: `(columns . rows)` |
 | `mysql-execute` | `(conn sql)` | Affected rows (integer) |
+| `mysql-warning-count` | `(conn)` | Warning count (integer) |
 | `mysql-version` | `()` | Version string |
 | `mysqlp` | `(obj)` | Whether it's a valid connection |
 | `mysql-available-p` | `()` | Whether the module is available |
+
+**Error signal**: `mysql-error` symbol with data `(ERRNO SQLSTATE ERRMSG)`.
+Prepared statement errors use the same symbol.
 
 ## 6. Output System
 
@@ -530,7 +552,7 @@ No registration needed — `isqlm--try-builtin-command` auto-discovers `\`-prefi
 6. **`isqlm--history-save` must capture buffer-locals before `with-temp-file`** — the macro switches buffers
 7. **`\quit`/`\exit` kills the buffer** — `isqlm-send-input` checks `(buffer-live-p isqlm-buf)` afterward to avoid operating on a dead buffer
 8. **Multi-statement input is split by `isqlm--split-statements`** — it's quote/comment-aware; each statement is executed individually via `isqlm--execute-sql`
-9. **Use `isqlm--error-message` instead of `error-message-string`** — mysql-el signals errors with a plain string data, which `error-message-string` cannot parse
+9. **Use `isqlm--error-message` instead of `error-message-string`** — `mysql-el` signals `mysql-error` with structured data `(ERRNO SQLSTATE ERRMSG)` which `error-message-string` cannot format; `isqlm--error-message` handles both `mysql-error` and generic `error` signals
 
 ## 14. Unit Tests
 
@@ -561,7 +583,7 @@ emacs -batch -l isqlm.el -l isqlm-test.el -f ert-run-tests-batch-and-exit
 | Command Aliases | `isqlm-test-command-aliases` | Alias alist entries (`?`→`help`, `h`→`help`, `q`→`quit`, `u`→`use`, `.`→`i`) |
 | Conditional Detection | `isqlm-test-cond-flow-command-p` | `isqlm--cond-flow-command-p` correctly identifies `\if`/`\elif`/`\else`/`\endif` and rejects others |
 | Display Width | `isqlm-test-display-width` | Multi-line string width calculation for table rendering |
-| Error Messages | `isqlm-test-error-message` | `isqlm--error-message` handles mysql-el's `(error . "string")` and standard `(error "fmt" args...)` formats |
+| Error Messages | `isqlm-test-error-message` | `isqlm--error-message` handles `mysql-error` structured signals `(mysql-error ERRNO SQLSTATE ERRMSG)`, generic `(error . "string")`, and standard `(error "fmt" args...)` formats; tests `isqlm--mysql-error-p` predicate and accessor functions |
 
 ### Design Principles
 

@@ -394,6 +394,19 @@ Regression test: :varname was not expanded before eval."
                  "got 3 errors"))
   ;; Single format string
   (should (equal (isqlm--error-message '(error "simple error"))
-                 "simple error")))
+                 "simple error"))
+  ;; mysql-error signal: (mysql-error ERRNO SQLSTATE ERRMSG)
+  (should (equal (isqlm--error-message '(mysql-error 1690 "22003" "BIGINT value is out of range"))
+                 "ERROR 1690 (22003): BIGINT value is out of range"))
+  (should (equal (isqlm--error-message '(mysql-error 2003 "HY000" "Can't connect to MySQL server"))
+                 "ERROR 2003 (HY000): Can't connect to MySQL server"))
+  ;; mysql-error-p predicate
+  (should (isqlm--mysql-error-p '(mysql-error 1690 "22003" "msg")))
+  (should-not (isqlm--mysql-error-p '(error . "msg")))
+  ;; Accessors
+  (let ((err '(mysql-error 1690 "22003" "BIGINT overflow")))
+    (should (= (isqlm--mysql-error-errno err) 1690))
+    (should (equal (isqlm--mysql-error-sqlstate err) "22003"))
+    (should (equal (isqlm--mysql-error-errmsg err) "BIGINT overflow"))))
 
 ;;; isqlm-test.el ends here
