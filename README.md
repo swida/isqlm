@@ -414,7 +414,6 @@ All options are in the `isqlm` customize group (`M-x customize-group RET isqlm`)
 | `isqlm-default-user` | `"root"` | Default user |
 | `isqlm-prompt-password` | `nil` | Prompt for password on connect |
 | `isqlm-auto-reconnect` | `t` | Auto-reconnect on connection loss |
-| `isqlm-query-timeout` | `30` | Read/write/connect timeout in seconds (0 = no timeout) |
 | `isqlm-noisy` | `t` | Beep on errors |
 
 ## Extending with Custom Commands

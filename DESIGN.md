@@ -21,8 +21,10 @@ ISQLM adopts an **Eshell-style architecture**: no dependency on `comint-mode`, n
 │                  ↓                           │
 │  ┌───────────────────────────────────────┐  │
 │  │  mysql-el dynamic module (C FFI)      │  │
-│  │  mysql-open / mysql-select /          │  │
-│  │  mysql-execute / mysql-close          │  │
+│  │  mysql-open / mysql-open-poll /       │  │
+│  │  mysql-query / mysql-query-poll /     │  │
+│  │  mysql-select / mysql-execute /       │  │
+│  │  mysql-close                          │  │
 │  └───────────────────────────────────────┘  │
 └─────────────────────────────────────────────┘
 ```
@@ -282,7 +284,7 @@ This mimics the MySQL CLI's behavior: when the server crashes/restarts, the next
 
 ### Async (Non-blocking) Execution
 
-When `mysql-el` provides the `mysql-query-start` function (requires MySQL 8.0.16+ `libmysqlclient` with `_nonblocking` API), SQL queries are executed **asynchronously** — Emacs remains fully responsive during long-running queries.
+When `mysql-el` provides the unified `mysql-query` function with an `ASYNC` parameter (requires MySQL 8.0.16+ `libmysqlclient` with `_nonblocking` API), SQL queries are executed **asynchronously** — Emacs remains fully responsive during long-running queries.
 
 **Architecture:**
 
@@ -290,42 +292,54 @@ When `mysql-el` provides the `mysql-query-start` function (requires MySQL 8.0.16
 User presses RET
   → isqlm--async-execute-statements
     → isqlm--async-execute-one (for each statement)
-      → mysql-query-start (non-blocking, returns immediately)
-      → run-with-timer (20ms interval)
-        → isqlm--async-poll-query
-          → mysql-query-continue (non-blocking)
-          → when complete: isqlm--async-store-result
-            → mysql-store-result-start (non-blocking)
-            → isqlm--async-poll-store
-              → mysql-store-result-continue
-              → when complete: isqlm--async-process-result
-                → mysql-async-result (sync — data already in client memory)
-                → format and output result
-                → callback → next statement or emit prompt
+      → mysql-query conn sql t  (ASYNC=t, non-blocking)
+      ├─ returns result plist → immediate: format-and-output-result → callback
+      └─ returns 'not-ready → run-with-timer (20ms interval)
+           → isqlm--poll-query
+             → mysql-query-poll conn
+             ├─ 'not-ready → continue polling
+             └─ result plist → cancel timer → format-and-output-result → callback
+                                              → next statement or emit prompt
+```
+
+**Async connect** (used by `isqlm--do-connect`):
+
+```
+isqlm--do-connect
+  → mysql-open host user pass db port t  (ASYNC=t)
+  → run-with-timer (20ms)
+    → isqlm--poll-connect
+      → mysql-open-poll conn
+      ├─ 'not-ready → continue polling
+      └─ 'complete → cancel timer → output "Connected to ..." → emit prompt
 ```
 
 **Key design points:**
 
-1. **Timer-based polling**: `run-with-timer` at 20ms intervals calls `mysql-query-continue` / `mysql-store-result-continue`, which are non-blocking C calls that return immediately
-2. **Input blocking**: While async query runs, `isqlm--async-busy` is set; `RET` shows "Query in progress... (C-c C-c to cancel)"
-3. **C-c C-c cancellation**: `isqlm-interrupt` calls `isqlm--async-cancel` which cancels the polling timer
-4. **Fallback**: When async API is unavailable (`mysql-query-start` not `fboundp`), falls back to synchronous `isqlm--execute-sql`
-5. **USE statements**: Handled synchronously (fast, no result set)
-6. **Multi-statement**: Statements are chained via callbacks — each statement's completion triggers the next
+1. **Unified sync/async API**: `mysql-query` and `mysql-open` accept an optional `ASYNC` parameter (last arg = `t`). When ASYNC, a single `mysql-query-poll` / `mysql-open-poll` call replaces the old multi-step `start`/`continue`/`store-result` workflow
+2. **Result plist**: `mysql-query` / `mysql-query-poll` return a plist — `(:type select :columns (...) :rows (...) :warning-count N)` or `(:type dml :affected-rows N :warning-count N)` — eliminating the need for separate `mysql-async-result` / `mysql-async-affected-rows` / `mysql-async-field-count` calls
+3. **Shared result formatting**: `isqlm--format-and-output-result` handles the result plist for both sync and async paths (sync via `isqlm--execute-sql-1` still uses the old `mysql-select`/`mysql-execute` APIs for backward compatibility)
+4. **Timer-based polling**: `run-with-timer` at 20ms intervals calls `mysql-query-poll`, which is a non-blocking C call that returns immediately
+5. **Input blocking**: While async query runs, `isqlm--async-busy` is set; `RET` shows "Query in progress... (C-c C-c to cancel)"
+6. **C-c C-c cancellation**: `isqlm-interrupt` calls `isqlm--async-cancel` which cancels the polling timer
+7. **Fallback**: When async API is unavailable (`mysql-query` not `fboundp`), falls back to synchronous `isqlm--execute-sql`
+8. **USE statements**: Handled synchronously (fast, no result set)
+9. **Multi-statement**: Statements are chained via callbacks — each statement's completion triggers the next
 
-**C-side async API** (`mysql-el`):
+**Core async functions** (3 functions, down from ~5 in the old architecture):
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `mysql-query-start` | `(db sql)` → symbol | Begin async query; returns `'complete`, `'not-ready`, or `'error` |
-| `mysql-query-continue` | `(db)` → symbol | Continue async query |
-| `mysql-store-result-start` | `(db)` → `(status . result)` | Begin fetching result set |
-| `mysql-store-result-continue` | `(db)` → `(status . result)` | Continue fetching result set |
-| `mysql-async-result` | `(db res &optional full)` → list | Convert stored result to Elisp list (no I/O) |
-| `mysql-async-affected-rows` | `(db)` → integer | Affected row count after non-SELECT |
-| `mysql-async-field-count` | `(db)` → integer | Field count (0 = not SELECT) |
-| `mysql-warning-count` | `(db)` → integer | Warning count from last statement |
-| Other (INSERT/UPDATE/DDL…) | `mysql-execute` | Display affected rows |
+| Function | Description |
+|----------|-------------|
+| `isqlm--async-execute-one` | Start async query via `mysql-query conn sql t`; if immediate result, format and callback; otherwise set up poll timer |
+| `isqlm--poll-query` | Timer callback: call `mysql-query-poll`, on completion format result and invoke callback |
+| `isqlm--format-and-output-result` | Shared formatter: takes result plist, dispatches by `:type` (`select`/`dml`), handles `\gset`/vertical/table display |
+
+**Async connect functions:**
+
+| Function | Description |
+|----------|-------------|
+| `isqlm--do-connect` | Call `mysql-open ... t` (ASYNC), set up poll timer |
+| `isqlm--poll-connect` | Timer callback: call `mysql-open-poll`, on `'complete` output connection info and emit prompt |
 
 ### SQL Terminators
 
@@ -382,14 +396,22 @@ In a `condition-case` handler, `err` is `(mysql-error 1690 "22003" "BIGINT value
 
 | Function | Signature | Return value |
 |----------|-----------|--------------|
-| `mysql-open` | `(host user pass db port timeout)` | Connection object |
+| `mysql-open` | `(host user pass [db] [port] [async])` | Connection object; ASYNC=t for non-blocking connect |
+| `mysql-open-poll` | `(conn)` | `'not-ready` or `'complete` |
 | `mysql-close` | `(conn)` | nil |
-| `mysql-select` | `(conn sql &optional types full)` | full mode: `(columns . rows)` |
-| `mysql-execute` | `(conn sql)` | Affected rows (integer) |
+| `mysql-query` | `(conn sql [async])` | Result plist or `'not-ready` (when ASYNC=t) |
+| `mysql-query-poll` | `(conn)` | Result plist or `'not-ready` |
+| `mysql-select` | `(conn sql [types] [full])` | Convenience sync alias; full: `(columns . rows)` |
+| `mysql-execute` | `(conn sql [params])` | Convenience sync alias; affected rows (integer) |
 | `mysql-warning-count` | `(conn)` | Warning count (integer) |
 | `mysql-version` | `()` | Version string |
 | `mysqlp` | `(obj)` | Whether it's a valid connection |
 | `mysql-available-p` | `()` | Whether the module is available |
+
+**Result plist format** (returned by `mysql-query` / `mysql-query-poll`):
+
+- SELECT: `(:type select :columns ("col1" ...) :rows ((val1 ...) ...) :warning-count N)`
+- DML: `(:type dml :affected-rows N :warning-count N)`
 
 **Error signal**: `mysql-error` symbol with data `(ERRNO SQLSTATE ERRMSG)`.
 Prepared statement errors use the same symbol.
@@ -482,7 +504,6 @@ All options belong to the `isqlm` customize group:
 | `isqlm-default-database` | `""` | Default database |
 | `isqlm-prompt-password` | `nil` | Prompt for password on connect |
 | `isqlm-auto-reconnect` | `t` | Auto-reconnect on connection loss |
-| `isqlm-query-timeout` | `30` | Read/write/connect timeout in seconds (0 = no timeout) |
 | `isqlm-max-column-width` | `0` | Max column width (0 = auto/window width) |
 | `isqlm-max-rows` | `1000` | Max rows displayed |
 | `isqlm-null-string` | `"NULL"` | Display string for NULL |

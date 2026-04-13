@@ -88,14 +88,6 @@ isqlm will attempt to reconnect using the last connection parameters
 and re-execute the failed SQL statement."
   :type 'boolean :group 'isqlm)
 
-(defcustom isqlm-query-timeout 30
-  "Read/write/connect timeout in seconds for MySQL operations.
-0 means no timeout (the default MySQL behavior).
-Setting this to a positive value (e.g. 30) prevents Emacs from hanging
-indefinitely when the MySQL server becomes unresponsive (e.g. stopped
-in a debugger, network partition, server crash)."
-  :type 'integer :group 'isqlm)
-
 (defcustom isqlm-max-column-width 0
   "Maximum column width in result tables.
 0 means no artificial limit — columns will be as wide as needed,
@@ -331,18 +323,22 @@ If ERR is nil, output \"*** Error *** Unknown error\"."
        (concat (isqlm--error-message err) "\n"))
     (isqlm--output-error "*** Error *** Unknown error\n")))
 
-(defun isqlm--warning-count-string ()
-  "Return a string like \", 2 warnings\" if there are warnings, else \"\"."
-  (if (and isqlm-connection
-           (condition-case nil (mysqlp isqlm-connection) (error nil))
-           (fboundp 'mysql-warning-count))
-      (let ((wc (condition-case nil
-                    (mysql-warning-count isqlm-connection)
-                  (error 0))))
-        (if (and (integerp wc) (> wc 0))
-            (format ", %d %s" wc (if (= wc 1) "warning" "warnings"))
-          ""))
-    ""))
+(defun isqlm--warning-count-string (&optional result-plist)
+  "Return a string like \", 2 warnings\" if there are warnings, else \"\".
+If RESULT-PLIST is given, extract :warning-count from it.
+Otherwise, query the connection with `mysql-warning-count'."
+  (let ((wc (if result-plist
+                (or (plist-get result-plist :warning-count) 0)
+              (if (and isqlm-connection
+                       (condition-case nil (mysqlp isqlm-connection) (error nil))
+                       (fboundp 'mysql-warning-count))
+                  (condition-case nil
+                      (mysql-warning-count isqlm-connection)
+                    (error 0))
+                0))))
+    (if (and (integerp wc) (> wc 0))
+        (format ", %d %s" wc (if (= wc 1) "warning" "warnings"))
+      "")))
 
 ;; ============================================================
 ;; Connection helpers
@@ -385,8 +381,7 @@ Returns non-nil if reconnection succeeded."
           (progn
             (setq isqlm-connection
                   (mysql-open host user (or password "")
-                              (if (string= database "") nil database) port
-                              (and (> isqlm-query-timeout 0) isqlm-query-timeout)))
+                              (if (string= database "") nil database) port))
             (setq isqlm-connection-info
                   (list :host host :port port :user user
                         :password password :database database))
@@ -1061,12 +1056,12 @@ Returns formatted output string."
          'font-lock-face 'isqlm-info-face)))))))
 
 ;; ============================================================
-;; Async SQL Execution (non-blocking)
+;; Async SQL Execution (non-blocking, via mysql-query / mysql-query-poll)
 ;; ============================================================
 
 (defun isqlm--async-available-p ()
   "Return non-nil if the async mysql API is available."
-  (fboundp 'mysql-query-start))
+  (fboundp 'mysql-query))
 
 (defun isqlm--async-execute-statements (statements buffer)
   "Execute STATEMENTS asynchronously one by one in BUFFER.
@@ -1098,8 +1093,6 @@ CALLBACK is called (with no args) when this statement completes."
       (let* ((parsed (isqlm--strip-terminator sql))
              (query (car parsed))
              (mode (cdr parsed))
-             (gset-p (and (listp mode) (eq (car mode) :gset)))
-             (vertical (and (not gset-p) (eq mode t)))
              (upper (upcase (string-trim-left query))))
         (setq isqlm-last-query sql)
         (when (string= query "")
@@ -1115,67 +1108,54 @@ CALLBACK is called (with no args) when this statement completes."
              (isqlm--output-mysql-error err)))
           (funcall callback)
           (throw 'done nil))
-        ;; Start async query
+        ;; Start async query via mysql-query
         (condition-case err
-            (let ((status (mysql-query-start isqlm-connection query)))
-              (cond
-               ((eq status 'complete)
-                ;; Query phase done immediately, proceed to store result
-                (isqlm--async-store-result buffer query mode callback))
-               ((eq status 'not-ready)
-                ;; Poll with timer
+            (let ((result (mysql-query isqlm-connection query t)))
+              (if (not (eq result 'not-ready))
+                  ;; Completed immediately — process result plist
+                  (progn
+                    (isqlm--format-and-output-result result sql mode)
+                    (funcall callback))
+                ;; Not ready — poll with timer
                 (setq isqlm--async-state
                       (list :phase 'query :sql sql :query query
                             :mode mode :callback callback
                             :timer (run-with-timer
                                     0.02 0.02
-                                    #'isqlm--async-poll-query buffer))))
-               (t
-                (isqlm--output-error
-                 (format "*** Error *** async query start failed\n"))
-                (funcall callback))))
-        (error
-         ;; Connection lost?  Try auto-reconnect + fall back to sync
-         (if (and isqlm-auto-reconnect
-                  isqlm-connection-info
-                  (isqlm--connection-lost-p err))
-             (when (isqlm--try-auto-reconnect)
-               ;; Retry synchronously after reconnect
-               (condition-case err2
-                   (isqlm--output (isqlm--execute-sql-1 sql))
-                 (error
-                  (when isqlm-noisy (ding))
-                  (isqlm--output-mysql-error err2)))
-               (funcall callback))
-           (when isqlm-noisy (ding))
-           (isqlm--output-mysql-error err)
-           (funcall callback))))))))
-(defun isqlm--async-poll-query (buffer)
-  "Timer callback: poll query phase progress."
+                                    #'isqlm--poll-query buffer)))))
+          (error
+           ;; Connection lost? Try auto-reconnect + fall back to sync
+           (if (and isqlm-auto-reconnect
+                    isqlm-connection-info
+                    (isqlm--connection-lost-p err))
+               (when (isqlm--try-auto-reconnect)
+                 (condition-case err2
+                     (isqlm--output (isqlm--execute-sql-1 sql))
+                   (error
+                    (when isqlm-noisy (ding))
+                    (isqlm--output-mysql-error err2)))
+                 (funcall callback))
+             (when isqlm-noisy (ding))
+             (isqlm--output-mysql-error err)
+             (funcall callback))))))))
+
+(defun isqlm--poll-query (buffer)
+  "Timer callback: poll async query progress via mysql-query-poll."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (when isqlm--async-state
         (condition-case err
-            (let ((status (mysql-query-continue isqlm-connection)))
-              (cond
-               ((eq status 'complete)
-                ;; Cancel timer, proceed to store-result
+            (let ((result (mysql-query-poll isqlm-connection)))
+              (unless (eq result 'not-ready)
+                ;; Query complete — cancel timer and process result
                 (let ((timer (plist-get isqlm--async-state :timer))
-                      (query (plist-get isqlm--async-state :query))
+                      (sql (plist-get isqlm--async-state :sql))
                       (mode (plist-get isqlm--async-state :mode))
                       (callback (plist-get isqlm--async-state :callback)))
                   (when timer (cancel-timer timer))
                   (setq isqlm--async-state nil)
-                  (isqlm--async-store-result buffer query mode callback)))
-               ((eq status 'not-ready)
-                nil)  ; keep polling
-               (t
-                (let ((timer (plist-get isqlm--async-state :timer))
-                      (callback (plist-get isqlm--async-state :callback)))
-                  (when timer (cancel-timer timer))
-                  (setq isqlm--async-state nil)
-                  (isqlm--output-mysql-error)
-                  (when callback (funcall callback))))))
+                  (isqlm--format-and-output-result result sql mode)
+                  (when callback (funcall callback)))))
           (error
            (let ((timer (plist-get isqlm--async-state :timer))
                  (callback (plist-get isqlm--async-state :callback)))
@@ -1186,174 +1166,70 @@ CALLBACK is called (with no args) when this statement completes."
              (isqlm--output-mysql-error err)
              (when callback (funcall callback)))))))))
 
-(defun isqlm--async-store-result (buffer query mode callback)
-  "Begin the store-result phase after query completes."
-  (with-current-buffer buffer
-    (condition-case err
-        (let ((pair (mysql-store-result-start isqlm-connection)))
-          (let ((status (car pair))
-                (res-ptr (cdr pair)))
-            (cond
-             ((eq status 'complete)
-              ;; Result is ready, process it immediately
-              (isqlm--async-process-result buffer query mode res-ptr)
-              (funcall callback))
-             ((eq status 'not-ready)
-              ;; Poll with timer
-              (setq isqlm--async-state
-                    (list :phase 'store :query query
-                          :mode mode :callback callback
-                          :timer (run-with-timer
-                                  0.02 0.02
-                                  #'isqlm--async-poll-store buffer))))
-             (t
-              (isqlm--output-mysql-error)
-              (funcall callback)))))
-      (error
-       (when isqlm-noisy (ding))
-       (isqlm--output-mysql-error err)
-       (funcall callback)))))
-
-(defun isqlm--async-poll-store (buffer)
-  "Timer callback: poll store-result phase progress."
-  (when (buffer-live-p buffer)
-    (with-current-buffer buffer
-      (when isqlm--async-state
-        (condition-case err
-            (let* ((pair (mysql-store-result-continue isqlm-connection))
-                   (status (car pair))
-                   (res-ptr (cdr pair)))
-              (cond
-               ((eq status 'complete)
-                (let ((timer (plist-get isqlm--async-state :timer))
-                      (query (plist-get isqlm--async-state :query))
-                      (mode (plist-get isqlm--async-state :mode))
-                      (callback (plist-get isqlm--async-state :callback)))
-                  (when timer (cancel-timer timer))
-                  (setq isqlm--async-state nil)
-                  (isqlm--async-process-result buffer query mode res-ptr)
-                  (when callback (funcall callback))))
-               ((eq status 'not-ready)
-                nil)  ; keep polling
-               (t
-                (let ((timer (plist-get isqlm--async-state :timer))
-                      (callback (plist-get isqlm--async-state :callback)))
-                  (when timer (cancel-timer timer))
-                  (setq isqlm--async-state nil)
-                  (isqlm--output-mysql-error)
-                  (when callback (funcall callback))))))
-          (error
-           (let ((timer (plist-get isqlm--async-state :timer))
-                 (callback (plist-get isqlm--async-state :callback)))
-             (when timer (cancel-timer timer))
-             (setq isqlm--async-state nil)
-             (setq isqlm--async-busy nil)
-             (when isqlm-noisy (ding))
-             (isqlm--output-mysql-error err)
-             (when callback (funcall callback)))))))))
-
-(defun isqlm--async-process-result (buffer query mode res-ptr)
-  "Process the completed async query result and output it.
-RES-PTR is the MYSQL_RES user-ptr (or nil for non-SELECT)."
-  (with-current-buffer buffer
-    (let* ((gset-p (and (listp mode) (eq (car mode) :gset)))
-           (gset-prefix (and gset-p (cadr mode)))
-           (vertical (and (not gset-p) (eq mode t)))
-           (upper (upcase (string-trim-left query))))
-      (cond
-       ;; SELECT-like query with result set
-       ((and res-ptr
-             (or (string-prefix-p "SELECT" upper)
-                 (string-prefix-p "SHOW" upper)
-                 (string-prefix-p "DESCRIBE" upper)
-                 (string-prefix-p "DESC " upper)
-                 (string-prefix-p "EXPLAIN" upper)
-                 gset-p))
-        (let ((result (mysql-async-result isqlm-connection res-ptr t)))
-          (setq isqlm-last-result result)
-          (if gset-p
-              ;; \gset: store result as variables
-              (cond
-               ((null result)
-                (isqlm--output-error "*** Error *** Query returned no results\n"))
-               ((/= (length (cdr result)) 1)
-                (isqlm--output-error
-                 (format "*** Error *** \\gset requires exactly 1 row, got %d\n"
-                         (length (cdr result)))))
-               (t
-                (let ((columns (car result))
-                      (row (cadr result)))
-                  (dotimes (i (length columns))
-                    (set (intern (concat (or gset-prefix "") (nth i columns)))
-                         (nth i row))))))
-            ;; Normal SELECT display
-            (if (null result)
-                (isqlm--output
-                 (propertize (format "Empty set (0 rows)%s\n" (isqlm--warning-count-string))
-                             'font-lock-face 'isqlm-info-face))
-              (let* ((columns (car result))
-                     (rows (cdr result))
-                     (nrows (length rows))
-                     (truncated nil))
-                (when (and (> isqlm-max-rows 0) (> nrows isqlm-max-rows))
-                  (setq rows (seq-take rows isqlm-max-rows))
-                  (setq truncated t))
-                (isqlm--output
-                 (concat
-                  (if vertical
-                      (let ((n 0))
-                        (mapconcat
-                         (lambda (row)
-                           (cl-incf n)
-                           (concat (format "*************************** %d. row ***************************\n" n)
-                                   (isqlm--format-vertical columns row) "\n"))
-                         rows ""))
-                    (isqlm--format-table columns rows))
-                  (propertize
-                   (let ((ws (isqlm--warning-count-string)))
-                     (if truncated
-                         (format "%d rows in set%s (truncated from %d)\n" (length rows) ws nrows)
-                       (format "%d %s in set%s\n" nrows (if (= nrows 1) "row" "rows") ws)))
-                   'font-lock-face 'isqlm-info-face))))))))
-      ;; SELECT-like query but no result set — query error
-       ;; (Safety net: C layer should have signaled an error already,
-       ;; but handle the case defensively.)
-       ((and (not res-ptr)
-             (or (string-prefix-p "SELECT" upper)
-                 (string-prefix-p "SHOW" upper)
-                 (string-prefix-p "DESCRIBE" upper)
-                 (string-prefix-p "DESC " upper)
-                 (string-prefix-p "EXPLAIN" upper)))
-        (let ((field-count (mysql-async-field-count isqlm-connection)))
-          (if (and (integerp field-count) (> field-count 0))
-              ;; Expected a result set but got none — an error occurred
-              (isqlm--output-mysql-error)
-            ;; field-count is 0 — somehow not a SELECT after all
-            (let ((affected (mysql-async-affected-rows isqlm-connection)))
-              (isqlm--output
-               (propertize
-                (let ((ws (isqlm--warning-count-string)))
-                  (if (and (integerp affected) (>= affected 0))
-                      (format "Query OK, %d %s affected%s\n"
-                              affected (if (= affected 1) "row" "rows") ws)
-                    (format "Query OK%s\n" ws)))
-                'font-lock-face 'isqlm-info-face))))))
-       ;; Non-SELECT (DML/DDL)
-       (t
-        ;; Free the res-ptr if it exists but was not a SELECT
-        (when res-ptr
-          (condition-case nil
-              (mysql-async-result isqlm-connection res-ptr nil)
-            (error nil)))
-        (let ((affected (mysql-async-affected-rows isqlm-connection)))
-          (isqlm--output
-           (propertize
-            (let ((ws (isqlm--warning-count-string)))
-              (if (and (integerp affected) (>= affected 0))
-                  (format "Query OK, %d %s affected%s\n"
-                          affected (if (= affected 1) "row" "rows") ws)
-                (format "Query OK%s\n" ws)))
-            'font-lock-face 'isqlm-info-face))))))))
+(defun isqlm--format-and-output-result (result sql mode)
+  "Format RESULT plist from `mysql-query' and output to buffer.
+SQL is the original statement, MODE is the terminator mode."
+  (let* ((type (plist-get result :type))
+         (gset-p (and (listp mode) (eq (car mode) :gset)))
+         (gset-prefix (and gset-p (cadr mode)))
+         (vertical (and (not gset-p) (eq mode t)))
+         (ws (isqlm--warning-count-string result)))
+    (pcase type
+      ('select
+       (let ((columns (plist-get result :columns))
+             (rows (plist-get result :rows)))
+         (setq isqlm-last-result
+               (when columns (cons columns rows)))
+         (if gset-p
+             ;; \gset: store result as variables
+             (cond
+              ((null rows)
+               (isqlm--output-error "*** Error *** Query returned no results\n"))
+              ((/= (length rows) 1)
+               (isqlm--output-error
+                (format "*** Error *** \\gset requires exactly 1 row, got %d\n"
+                        (length rows))))
+              (t
+               (let ((row (car rows)))
+                 (dotimes (i (length columns))
+                   (set (intern (concat (or gset-prefix "") (nth i columns)))
+                        (nth i row))))))
+           ;; Normal SELECT display
+           (if (null rows)
+               (isqlm--output
+                (propertize (format "Empty set (0 rows)%s\n" ws)
+                            'font-lock-face 'isqlm-info-face))
+             (let* ((nrows (length rows))
+                    (truncated nil))
+               (when (and (> isqlm-max-rows 0) (> nrows isqlm-max-rows))
+                 (setq rows (seq-take rows isqlm-max-rows))
+                 (setq truncated t))
+               (isqlm--output
+                (concat
+                 (if vertical
+                     (let ((n 0))
+                       (mapconcat
+                        (lambda (row)
+                          (cl-incf n)
+                          (concat (format "*************************** %d. row ***************************\n" n)
+                                  (isqlm--format-vertical columns row) "\n"))
+                        rows ""))
+                   (isqlm--format-table columns rows))
+                 (propertize
+                  (if truncated
+                      (format "%d rows in set%s (truncated from %d)\n" (length rows) ws nrows)
+                    (format "%d %s in set%s\n" nrows (if (= nrows 1) "row" "rows") ws))
+                  'font-lock-face 'isqlm-info-face))))))))
+      ('dml
+       (let ((affected (plist-get result :affected-rows)))
+         (isqlm--output
+          (propertize
+           (if (and (integerp affected) (>= affected 0))
+               (format "Query OK, %d %s affected%s\n"
+                       affected (if (= affected 1) "row" "rows") ws)
+             (format "Query OK%s\n" ws))
+           'font-lock-face 'isqlm-info-face))))
+      (_ (isqlm--output-error "*** Error *** Unknown result type\n")))))
 
 (defun isqlm--async-cancel ()
   "Cancel any in-progress async query."
@@ -1492,27 +1368,51 @@ via the echo area.  Set it to nil with:
         (isqlm--do-connect host user password database port)))))
 
 (defun isqlm--do-connect (host user password database port)
-  "Perform the actual MySQL connection.
+  "Perform the actual MySQL connection (async when available).
 HOST, USER, PASSWORD, DATABASE, PORT are connection parameters."
   (condition-case err
-      (progn
+      (let ((db-arg (if (string= database "") nil database)))
         (setq isqlm-connection
-              (mysql-open host user password
-                          (if (string= database "") nil database) port
-                          (and (> isqlm-query-timeout 0) isqlm-query-timeout)))
+              (mysql-open host user password db-arg port t))
         (setq isqlm-connection-info
               (list :host host :port port :user user
                     :password password :database database))
-        (setq mode-line-process
-              (list (format " [%s]" (isqlm--format-connection-info))))
-        (force-mode-line-update)
-        (let ((ver (condition-case nil (mysql-version) (error "unknown"))))
-          (isqlm--output-info
-           (format "Connected to %s (MySQL client library: %s)\n"
-                   (isqlm--format-connection-info) ver)))
-        (setq isqlm-pending-input ""))
+        ;; Poll until connected
+        (isqlm--output-info "Connecting...\n")
+        (setq isqlm--async-state
+              (list :phase 'connect
+                    :timer (run-with-timer
+                            0.02 0.02
+                            #'isqlm--poll-connect (current-buffer)))))
     (error
      (isqlm--output-mysql-error err))))
+
+(defun isqlm--poll-connect (buffer)
+  "Timer callback: poll async connect progress."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (condition-case err
+          (pcase (mysql-open-poll isqlm-connection)
+            ('not-ready nil)
+            ('complete
+             (when (plist-get isqlm--async-state :timer)
+               (cancel-timer (plist-get isqlm--async-state :timer)))
+             (setq isqlm--async-state nil)
+             (setq mode-line-process
+                   (list (format " [%s]" (isqlm--format-connection-info))))
+             (force-mode-line-update)
+             (let ((ver (condition-case nil (mysql-version) (error "unknown"))))
+               (isqlm--output-info
+                (format "Connected to %s (MySQL client library: %s)\n"
+                        (isqlm--format-connection-info) ver)))
+             (setq isqlm-pending-input "")
+             (isqlm--emit-prompt)))
+        (error
+         (when (and isqlm--async-state (plist-get isqlm--async-state :timer))
+           (cancel-timer (plist-get isqlm--async-state :timer)))
+         (setq isqlm--async-state nil)
+         (isqlm--output-mysql-error err)
+         (isqlm--emit-prompt))))))
 
 (defun isqlm/password (&rest _args)
   "Toggle whether \\connect prompts for a password.
@@ -1575,10 +1475,6 @@ When disabled, empty password is used."
       "Not connected.\n")
     (format "Query mode: %s\n"
             (if (isqlm--async-available-p) "async (non-blocking)" "sync (blocking)"))
-    (format "Query timeout: %s\n"
-            (if (> isqlm-query-timeout 0)
-                (format "%ds" isqlm-query-timeout)
-              "none"))
     (format "Auto-reconnect: %s\n" (if isqlm-auto-reconnect "on" "off"))
     (format "Table style: %s\n" isqlm-table-style)
     (format "Password prompt: %s\n" (if isqlm-prompt-password "on" "off")))))
