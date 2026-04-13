@@ -3,8 +3,10 @@
 ;; Copyright (C) 2026 Free Software Foundation, Inc.
 
 ;; Author: Hadley Wang
-;; Keywords: sql, mysql, database
-;; Version: 2.0
+;; URL: https://github.com/swida/isqlm
+;; Keywords: sql, mysql, database, tools
+;; Version: 2.1
+;; Package-Requires: ((emacs "29.1"))
 
 ;;; Commentary:
 
@@ -2333,6 +2335,39 @@ If STR does not end with `;' or `\\G', a `;' is appended automatically."
   "Send the entire buffer to the ISQLM process buffer."
   (interactive)
   (isqlm-send-string (buffer-substring-no-properties (point-min) (point-max))))
+
+;; ============================================================
+;; Execute SQL and display in a separate buffer
+;; ============================================================
+
+(defun isqlm-execute (sql &optional buf-name)
+  "Execute SQL and display the result in a separate buffer.
+BUF-NAME defaults to \"*isqlm-output*\".  The buffer uses `special-mode'
+so that `q' dismisses it.
+
+For SELECT results, the output is formatted as a table (or vertical
+if SQL ends with `\\G').  For DML, the affected-rows summary is shown.
+
+Returns the result plist from `isqlm-execute-string', so callers can
+further process the data or post-process the output buffer.
+
+This function must be called from an ISQLM buffer (or with the
+ISQLM buffer current) so that `isqlm-execute-string' can find
+the connection."
+  (interactive "sSQL: ")
+  (let* ((result (isqlm-execute-string sql))
+         (parsed (isqlm--strip-terminator sql))
+         (mode (cdr parsed))
+         (text (isqlm--format-result-string result mode))
+         (buf (get-buffer-create (or buf-name "*isqlm-output*"))))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert text)
+        (goto-char (point-min)))
+      (special-mode))
+    (display-buffer buf)
+    result))
 
 ;; ============================================================
 ;; Major mode (eshell-style: derived from fundamental-mode)

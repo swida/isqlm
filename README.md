@@ -37,8 +37,35 @@ through the [`mysql-el`](https://github.com/swida/mysql-el) dynamic module (C FF
 
 ## Installation
 
-1. Build and install `mysql-el` so that `(require 'mysql-el)` works.
-2. Add `isqlm.el` to your `load-path`:
+### Prerequisite
+
+Build and install `mysql-el` so that `(require 'mysql-el)` works.  See the
+[mysql-el README](https://github.com/swida/mysql-el) for instructions.
+
+### Option A: Manual
+
+```elisp
+(add-to-list 'load-path "/path/to/isqlm")
+(require 'isqlm)
+```
+
+### Option B: use-package + straight.el
+
+```elisp
+(use-package isqlm
+  :straight (:host github :repo "swida/isqlm")
+  :commands (isqlm isqlm-sql-connect isqlm-connect-and-run))
+```
+
+### Option C: use-package + vc (Emacs 30+)
+
+```elisp
+(use-package isqlm
+  :vc (:url "https://github.com/swida/isqlm")
+  :commands (isqlm isqlm-sql-connect isqlm-connect-and-run))
+```
+
+### Option D: Manual with autoload (lazy loading)
 
 ```elisp
 (add-to-list 'load-path "/path/to/isqlm")
@@ -397,6 +424,8 @@ A `*isqlm-script*` buffer opens with `sql-mode` syntax highlighting. Write your 
 
 ## Programmatic API
 
+### `isqlm-execute-string` — execute SQL, return structured data
+
 For Elisp code that needs to execute SQL and process the results programmatically
 (without displaying them in the ISQLM buffer), use `isqlm-execute-string`:
 
@@ -417,6 +446,44 @@ without changing calling code.
 
 The function performs connection checks and auto-reconnect (when
 `isqlm-auto-reconnect` is non-nil), and signals `mysql-error` on failure.
+
+### `isqlm-execute` — execute SQL, display in a separate buffer
+
+For displaying query results in a dedicated read-only buffer (outside the ISQLM
+prompt), use `isqlm-execute`:
+
+```elisp
+;; Display result in *isqlm-output* (default)
+(isqlm-execute "SHOW PROCESSLIST")
+
+;; Display in a named buffer
+(isqlm-execute "EXPLAIN FORMAT=TREE SELECT * FROM t1" "*Explain*")
+```
+
+The buffer uses `special-mode` — press `q` to dismiss.  SELECT results are
+formatted as tables (or vertical if SQL ends with `\G`); DML shows the
+affected-rows summary.
+
+**Example: show optimizer trace with JSON pretty-printing**
+
+```elisp
+(defun my-isqlm-show-optimizer-trace ()
+  "Show optimizer trace as pretty-printed JSON."
+  (interactive)
+  (let* ((result (isqlm-execute-string
+                  "SELECT trace FROM information_schema.optimizer_trace"))
+         (trace (car (car (plist-get result :rows))))
+         (buf (get-buffer-create "*Optimizer Trace*")))
+    (unless trace (user-error "No optimizer trace available"))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert trace)
+        (goto-char (point-min))
+        (ignore-errors (json-pretty-print-buffer)))
+      (special-mode))
+    (display-buffer buf)))
+```
 
 ## Customization
 

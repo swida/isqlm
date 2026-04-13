@@ -539,7 +539,16 @@ All options belong to the `isqlm` customize group:
 - `\connect NAME` at the prompt — Connect using a `sql-connection-alist` entry
 - `\connect [HOST] [USER] [DB] [PORT]` at the prompt — Connect with positional parameters (all optional, defaults applied); password prompted via echo area
 
-## 12.1 Sending SQL from External Buffers
+## 12.1 Programmatic API
+
+| Function | Description |
+|----------|-------------|
+| `isqlm-execute-string` | Execute SQL, return result plist; abstracts `mysql-el` for future multi-backend support |
+| `isqlm-execute` | Execute SQL, display result in a separate `special-mode` buffer (`q` to dismiss) |
+
+`isqlm-execute-string` is the low-level building block — it returns structured data.  `isqlm-execute` builds on it to provide a quick "run & view" workflow suitable for interactive commands (e.g. show processlist, explain plans, optimizer traces).
+
+## 12.2 Sending SQL from External Buffers
 
 | Function | Description |
 |----------|-------------|
