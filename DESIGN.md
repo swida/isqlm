@@ -263,14 +263,16 @@ Inspired by PostgreSQL's `psql` meta-commands. Uses a stack-based approach:
 All SQL execution goes through `mysql-query` (the unified sync/async API from `mysql-el`). There are two execution paths:
 
 1. **Interactive prompt** (`isqlm-send-input`) — always uses the **async** path: `mysql-query conn sql t` (ASYNC=t) → `mysql-query-poll` via timer
-2. **Scripts, for-loops, quick-sql, send-region** — use the **sync** path: `mysql-query conn sql` (no ASYNC) via `isqlm--execute-sql` → `isqlm--execute-sql-1`
+2. **Scripts, for-loops, quick-sql, send-region** — use the **sync** path via `isqlm--execute-sql`
 
 Both paths share `isqlm--format-result-string` for result formatting (table display, vertical display, `\gset`, row counts, warnings), eliminating duplicate formatting logic.
 
+**Public API**: `isqlm-execute-string` executes SQL and returns the raw result plist, abstracting the underlying database module. External code should use this instead of calling `mysql-query` directly, so that future database backends can be swapped transparently.
+
 | Function | Role |
 |----------|------|
-| `isqlm--execute-sql` | Sync entry point: connection check + auto-reconnect wrapper |
-| `isqlm--execute-sql-1` | Sync core: `mysql-query` (sync) + `isqlm--format-result-string`; USE handled specially |
+| `isqlm-execute-string` | **Public API**: execute SQL, return result plist; connection check + auto-reconnect |
+| `isqlm--execute-sql` | Internal: terminator parsing + USE side-effects + `isqlm--format-result-string`; delegates to `isqlm-execute-string` |
 | `isqlm--format-result-string` | **Shared**: format result plist into a string (SELECT/DML/\gset) |
 | `isqlm--format-and-output-result` | Thin wrapper: calls `isqlm--format-result-string` and outputs to buffer |
 | `isqlm--async-execute-one` | Async core: `mysql-query conn sql t` → immediate or poll |
@@ -278,9 +280,9 @@ Both paths share `isqlm--format-result-string` for result formatting (table disp
 
 ### Auto-Reconnect
 
-When `isqlm-auto-reconnect` is non-nil (default), `isqlm--execute-sql` wraps execution in a retry loop:
+When `isqlm-auto-reconnect` is non-nil (default), `isqlm-execute-string` wraps execution in a retry loop:
 
-1. Execute the SQL via `isqlm--execute-sql-1`
+1. Execute the SQL via `mysql-query`
 2. If execution signals an error, check `isqlm--connection-lost-p` — it matches common lost-connection messages (`"lost connection"`, `"server has gone away"`, `"closed database"`, etc.) and also tests `(isqlm--connected-p)`
 3. If the connection is lost, call `isqlm--try-auto-reconnect`:
    - Close the old (dead) connection handle silently
@@ -326,19 +328,20 @@ isqlm--do-connect
 
 1. **Unified sync/async API**: `mysql-query` and `mysql-open` accept an optional `ASYNC` parameter (last arg = `t`). When ASYNC, a single `mysql-query-poll` / `mysql-open-poll` call replaces the old multi-step `start`/`continue`/`store-result` workflow
 2. **Result plist**: `mysql-query` / `mysql-query-poll` return a plist — `(:type select :columns (...) :rows (...) :warning-count N)` or `(:type dml :affected-rows N :warning-count N)` — eliminating the need for separate `mysql-async-result` / `mysql-async-affected-rows` / `mysql-async-field-count` calls
-3. **Shared result formatting**: `isqlm--format-result-string` handles the result plist for both sync and async paths — sync via `isqlm--execute-sql-1`, async via `isqlm--format-and-output-result` (a thin wrapper)
+3. **Shared result formatting**: `isqlm--format-result-string` handles the result plist for both sync and async paths — sync via `isqlm--execute-sql`, async via `isqlm--format-and-output-result` (a thin wrapper)
 4. **Timer-based polling**: `run-with-timer` at 20ms intervals calls `mysql-query-poll`, which is a non-blocking C call that returns immediately
 5. **Input blocking**: While async query runs, `isqlm--async-busy` is set; `RET` shows "Query in progress... (C-c C-c to cancel)"
 6. **C-c C-c cancellation**: `isqlm-interrupt` calls `isqlm--async-cancel` which cancels the polling timer
 7. **USE statements**: Handled synchronously in both paths (fast, no result set)
 8. **Multi-statement**: Statements are chained via callbacks — each statement's completion triggers the next
-9. **Sync path**: Scripts (`\i`), for-loops (`\for`), quick-sql (`C-c C-t`, `isqlm-send-region`), and auto-reconnect retry use `isqlm--execute-sql` → `isqlm--execute-sql-1` (sync `mysql-query`)
+9. **Sync path**: Scripts (`\i`), for-loops (`\for`), quick-sql (`C-c C-t`, `isqlm-send-region`), and auto-reconnect retry use `isqlm--execute-sql` → `isqlm-execute-string` (sync `mysql-query`)
 
 **Core functions:**
 
 | Function | Description |
 |----------|-------------|
-| `isqlm--execute-sql-1` | Sync core: `mysql-query` (sync) → `isqlm--format-result-string`; USE updates mode-line |
+| `isqlm-execute-string` | **Public API**: execute SQL, return result plist; connection check + auto-reconnect |
+| `isqlm--execute-sql` | Internal: terminator parsing, USE side-effects, result formatting via `isqlm-execute-string` |
 | `isqlm--format-result-string` | **Shared formatter**: takes result plist + mode, returns formatted string (SELECT table/vertical/\gset, DML affected-rows) |
 | `isqlm--format-and-output-result` | Async output wrapper: calls `isqlm--format-result-string`, outputs to buffer |
 | `isqlm--async-execute-one` | Start async query via `mysql-query conn sql t`; if immediate result, format and callback; otherwise set up poll timer |
@@ -578,7 +581,7 @@ No registration needed — `isqlm--try-builtin-command` auto-discovers `\`-prefi
 1. **All buffer writes must use `(let ((inhibit-read-only t)) ...)`** — past output is read-only
 2. **Output must go through `isqlm--output` family** — they correctly maintain markers and text properties
 3. **Call `isqlm--emit-prompt` after command execution** — unless `isqlm-send-input` handles it
-4. **All SQL goes through `mysql-query`** — both sync (`isqlm--execute-sql-1`) and async (`isqlm--async-execute-one`) use `mysql-query`; result formatting is shared via `isqlm--format-result-string`
+4. **All SQL goes through `isqlm-execute-string`** — the public API for programmatic SQL execution; both sync (`isqlm--execute-sql`) and async (`isqlm--async-execute-one`) ultimately call `mysql-query` via this function or directly; result formatting is shared via `isqlm--format-result-string`
 5. **Update `mode-line-process` after connection state changes** — call `force-mode-line-update`
 6. **`isqlm--history-save` must capture buffer-locals before `with-temp-file`** — the macro switches buffers
 7. **`\quit`/`\exit` kills the buffer** — `isqlm-send-input` checks `(buffer-live-p isqlm-buf)` afterward to avoid operating on a dead buffer

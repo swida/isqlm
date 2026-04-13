@@ -947,40 +947,18 @@ Cells containing newlines are split across multiple display lines."
 
 (defun isqlm--execute-sql (sql)
   "Execute SQL and return formatted output string.
-If the connection is lost during execution and `isqlm-auto-reconnect'
-is non-nil, automatically reconnect and retry the SQL once."
-  (unless (or (isqlm--connected-p) isqlm-connection-info)
-    (error "Not connected.  Use `\\connect' or M-x isqlm-connect"))
-  ;; Try to auto-reconnect if not currently connected but have info
-  (when (and (not (isqlm--connected-p)) isqlm-connection-info)
-    (unless (isqlm--try-auto-reconnect)
-      (error "Not connected.  Use `\\connect' or M-x isqlm-connect")))
+Handles terminator parsing, USE side-effects, and result formatting.
+Connection check and auto-reconnect are delegated to `isqlm-execute-string'."
   (setq isqlm-last-query sql)
-  (condition-case err
-      (isqlm--execute-sql-1 sql)
-    (error
-     ;; On connection loss, try reconnect + retry once
-     (if (and isqlm-auto-reconnect
-              isqlm-connection-info
-              (isqlm--connection-lost-p err))
-         (if (isqlm--try-auto-reconnect)
-             (isqlm--execute-sql-1 sql)
-           (signal (car err) (cdr err)))
-       (signal (car err) (cdr err))))))
-
-(defun isqlm--execute-sql-1 (sql)
-  "Internal: execute SQL without auto-reconnect logic.
-Uses `mysql-query' (sync) and `isqlm--format-result-string' for formatting.
-Returns formatted output string."
   (let* ((parsed (isqlm--strip-terminator sql))
          (query (car parsed))
          (mode (cdr parsed))
          (upper (upcase (string-trim-left query))))
     (when (string= query "")
       (error "Empty query"))
-    ;; USE: update connection-info + mode-line
+    ;; USE: execute + update connection-info and mode-line
     (when (string-prefix-p "USE" upper)
-      (mysql-query isqlm-connection query)
+      (isqlm-execute-string query)
       (let ((db-name (string-trim
                       (replace-regexp-in-string "\\`USE\\s-+" "" query))))
         (setq db-name (replace-regexp-in-string "[`'\"]" "" db-name))
@@ -988,12 +966,42 @@ Returns formatted output string."
         (setq mode-line-process
               (list (format " [%s]" (isqlm--format-connection-info))))
         (force-mode-line-update)
-        (cl-return-from isqlm--execute-sql-1
+        (cl-return-from isqlm--execute-sql
           (propertize (format "Database changed to: %s\n" db-name)
                       'font-lock-face 'isqlm-info-face))))
-    ;; All other SQL: use mysql-query (sync) → result plist
-    (let ((result (mysql-query isqlm-connection query)))
+    ;; All other SQL
+    (let ((result (isqlm-execute-string query)))
       (isqlm--format-result-string result mode))))
+
+(defun isqlm-execute-string (sql)
+  "Execute SQL on the current ISQLM connection and return a result plist.
+
+This is the public API for programmatic SQL execution.  It abstracts
+the underlying database module so that callers do not depend on
+`mysql-el' directly.
+
+The returned plist has one of the following shapes:
+
+  SELECT: (:type select :columns (\"col\" ...) :rows ((val ...) ...) :warning-count N)
+  DML:    (:type dml :affected-rows N :warning-count N)
+
+Signals `mysql-error' (or `error') on failure.
+Auto-reconnect is attempted if `isqlm-auto-reconnect' is non-nil."
+  (unless (or (isqlm--connected-p) isqlm-connection-info)
+    (error "Not connected.  Use `\\connect' or M-x isqlm-connect"))
+  (when (and (not (isqlm--connected-p)) isqlm-connection-info)
+    (unless (isqlm--try-auto-reconnect)
+      (error "Not connected.  Use `\\connect' or M-x isqlm-connect")))
+  (condition-case err
+      (mysql-query isqlm-connection sql)
+    (error
+     (if (and isqlm-auto-reconnect
+              isqlm-connection-info
+              (isqlm--connection-lost-p err))
+         (if (isqlm--try-auto-reconnect)
+             (mysql-query isqlm-connection sql)
+           (signal (car err) (cdr err)))
+       (signal (car err) (cdr err))))))
 
 ;; ============================================================
 ;; Async SQL Execution (non-blocking, via mysql-query / mysql-query-poll)
@@ -1038,7 +1046,7 @@ CALLBACK is called (with no args) when this statement completes."
         ;; USE is handled synchronously (fast, no result set)
         (when (string-prefix-p "USE" upper)
           (condition-case err
-              (isqlm--output (isqlm--execute-sql-1 sql))
+              (isqlm--output (isqlm--execute-sql sql))
             (error
              (when isqlm-noisy (ding))
              (isqlm--output-mysql-error err)))
@@ -1066,7 +1074,7 @@ CALLBACK is called (with no args) when this statement completes."
                     (isqlm--connection-lost-p err))
                (when (isqlm--try-auto-reconnect)
                  (condition-case err2
-                     (isqlm--output (isqlm--execute-sql-1 sql))
+                     (isqlm--output (isqlm--execute-sql sql))
                    (error
                     (when isqlm-noisy (ding))
                     (isqlm--output-mysql-error err2)))

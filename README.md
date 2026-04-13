@@ -395,6 +395,29 @@ A `*isqlm-script*` buffer opens with `sql-mode` syntax highlighting. Write your 
 | `M-x isqlm-sql-connect` | Select from `sql-connection-alist` with completion, open `*isqlm:NAME*` |
 | `M-x isqlm-connect-and-run` | Open buffer and connect with Lisp arguments |
 
+## Programmatic API
+
+For Elisp code that needs to execute SQL and process the results programmatically
+(without displaying them in the ISQLM buffer), use `isqlm-execute-string`:
+
+```elisp
+(let ((result (isqlm-execute-string "SELECT id, name FROM users LIMIT 3")))
+  (plist-get result :columns) ;; => ("id" "name")
+  (plist-get result :rows))   ;; => ((1 "Alice") (2 "Bob") (3 "Charlie"))
+```
+
+This function abstracts the underlying database module (`mysql-el`) so that
+callers do not depend on it directly — future database backends can be swapped
+without changing calling code.
+
+**Return value** — a plist with one of the following shapes:
+
+- **SELECT**: `(:type select :columns ("col" ...) :rows ((val ...) ...) :warning-count N)`
+- **DML**: `(:type dml :affected-rows N :warning-count N)`
+
+The function performs connection checks and auto-reconnect (when
+`isqlm-auto-reconnect` is non-nil), and signals `mysql-error` on failure.
+
 ## Customization
 
 All options are in the `isqlm` customize group (`M-x customize-group RET isqlm`):
