@@ -970,71 +970,17 @@ is non-nil, automatically reconnect and retry the SQL once."
 
 (defun isqlm--execute-sql-1 (sql)
   "Internal: execute SQL without auto-reconnect logic.
+Uses `mysql-query' (sync) and `isqlm--format-result-string' for formatting.
 Returns formatted output string."
   (let* ((parsed (isqlm--strip-terminator sql))
          (query (car parsed))
          (mode (cdr parsed))
-         (gset-p (and (listp mode) (eq (car mode) :gset)))
-         (gset-prefix (and gset-p (cadr mode)))
-         (vertical (and (not gset-p) (eq mode t)))
          (upper (upcase (string-trim-left query))))
     (when (string= query "")
       (error "Empty query"))
-    ;; \gset mode: execute and store results
-    (if gset-p
-        (let ((result (mysql-select isqlm-connection query nil 'full)))
-          (setq isqlm-last-result result)
-          (cond
-           ((null result)
-            (error "Query returned no results"))
-           ((/= (length (cdr result)) 1)
-            (error "\\gset requires exactly 1 row, got %d" (length (cdr result))))
-           (t
-            (let ((columns (car result))
-                  (row (cadr result)))
-              (dotimes (i (length columns))
-                (set (intern (concat gset-prefix (nth i columns)))
-                     (nth i row)))
-              ""))))
-      ;; Normal execution
-      (cond
-     ;; SELECT-like queries
-     ((or (string-prefix-p "SELECT" upper)
-          (string-prefix-p "SHOW" upper)
-          (string-prefix-p "DESCRIBE" upper)
-          (string-prefix-p "DESC " upper)
-          (string-prefix-p "EXPLAIN" upper))
-      (let ((result (mysql-select isqlm-connection query nil 'full)))
-        (setq isqlm-last-result result)
-        (if (null result)
-            (propertize (format "Empty set (0 rows)%s\n" (isqlm--warning-count-string))
-                        'font-lock-face 'isqlm-info-face)
-          (let* ((columns (car result))
-                 (rows (cdr result))
-                 (nrows (length rows))
-                 (truncated nil))
-            (when (and (> isqlm-max-rows 0) (> nrows isqlm-max-rows))
-              (setq rows (seq-take rows isqlm-max-rows))
-              (setq truncated t))
-            (concat
-             (if vertical
-                 (let ((n 0))
-                   (mapconcat
-                    (lambda (row)
-                      (cl-incf n)
-                      (concat (format "*************************** %d. row ***************************\n" n)
-                              (isqlm--format-vertical columns row) "\n"))
-                    rows ""))
-               (isqlm--format-table columns rows))
-             (propertize
-              (let ((ws (isqlm--warning-count-string)))
-                (if truncated
-                    (format "%d rows in set%s (truncated from %d)\n" (length rows) ws nrows)
-                  (format "%d %s in set%s\n" nrows (if (= nrows 1) "row" "rows") ws)))
-              'font-lock-face 'isqlm-info-face))))))
-    ;; USE
-    ((string-prefix-p "USE" upper)
-      (mysql-execute isqlm-connection query)
+    ;; USE: update connection-info + mode-line
+    (when (string-prefix-p "USE" upper)
+      (mysql-query isqlm-connection query)
       (let ((db-name (string-trim
                       (replace-regexp-in-string "\\`USE\\s-+" "" query))))
         (setq db-name (replace-regexp-in-string "[`'\"]" "" db-name))
@@ -1042,26 +988,16 @@ Returns formatted output string."
         (setq mode-line-process
               (list (format " [%s]" (isqlm--format-connection-info))))
         (force-mode-line-update)
-        (propertize (format "Database changed to: %s\n" db-name)
-                    'font-lock-face 'isqlm-info-face)))
-     ;; DML/DDL
-     (t
-      (let ((affected (mysql-execute isqlm-connection query)))
-        (propertize
-         (let ((ws (isqlm--warning-count-string)))
-           (if (and (integerp affected) (>= affected 0))
-               (format "Query OK, %d %s affected%s\n"
-                       affected (if (= affected 1) "row" "rows") ws)
-             (format "Query OK%s\n" ws)))
-         'font-lock-face 'isqlm-info-face)))))))
+        (cl-return-from isqlm--execute-sql-1
+          (propertize (format "Database changed to: %s\n" db-name)
+                      'font-lock-face 'isqlm-info-face))))
+    ;; All other SQL: use mysql-query (sync) → result plist
+    (let ((result (mysql-query isqlm-connection query)))
+      (isqlm--format-result-string result mode))))
 
 ;; ============================================================
 ;; Async SQL Execution (non-blocking, via mysql-query / mysql-query-poll)
 ;; ============================================================
-
-(defun isqlm--async-available-p ()
-  "Return non-nil if the async mysql API is available."
-  (fboundp 'mysql-query))
 
 (defun isqlm--async-execute-statements (statements buffer)
   "Execute STATEMENTS asynchronously one by one in BUFFER.
@@ -1166,9 +1102,10 @@ CALLBACK is called (with no args) when this statement completes."
              (isqlm--output-mysql-error err)
              (when callback (funcall callback)))))))))
 
-(defun isqlm--format-and-output-result (result sql mode)
-  "Format RESULT plist from `mysql-query' and output to buffer.
-SQL is the original statement, MODE is the terminator mode."
+(defun isqlm--format-result-string (result mode)
+  "Format RESULT plist from `mysql-query' into a string.
+MODE is the terminator mode from `isqlm--strip-terminator'.
+Returns the formatted string, or \"\" for \\gset."
   (let* ((type (plist-get result :type))
          (gset-p (and (listp mode) (eq (car mode) :gset)))
          (gset-prefix (and gset-p (cadr mode)))
@@ -1184,52 +1121,60 @@ SQL is the original statement, MODE is the terminator mode."
              ;; \gset: store result as variables
              (cond
               ((null rows)
-               (isqlm--output-error "*** Error *** Query returned no results\n"))
+               (error "Query returned no results"))
               ((/= (length rows) 1)
-               (isqlm--output-error
-                (format "*** Error *** \\gset requires exactly 1 row, got %d\n"
-                        (length rows))))
+               (error "\\gset requires exactly 1 row, got %d" (length rows)))
               (t
                (let ((row (car rows)))
                  (dotimes (i (length columns))
                    (set (intern (concat (or gset-prefix "") (nth i columns)))
-                        (nth i row))))))
+                        (nth i row)))
+                 "")))
            ;; Normal SELECT display
            (if (null rows)
-               (isqlm--output
-                (propertize (format "Empty set (0 rows)%s\n" ws)
-                            'font-lock-face 'isqlm-info-face))
+               (propertize (format "Empty set (0 rows)%s\n" ws)
+                           'font-lock-face 'isqlm-info-face)
              (let* ((nrows (length rows))
                     (truncated nil))
                (when (and (> isqlm-max-rows 0) (> nrows isqlm-max-rows))
                  (setq rows (seq-take rows isqlm-max-rows))
                  (setq truncated t))
-               (isqlm--output
-                (concat
-                 (if vertical
-                     (let ((n 0))
-                       (mapconcat
-                        (lambda (row)
-                          (cl-incf n)
-                          (concat (format "*************************** %d. row ***************************\n" n)
-                                  (isqlm--format-vertical columns row) "\n"))
-                        rows ""))
-                   (isqlm--format-table columns rows))
-                 (propertize
-                  (if truncated
-                      (format "%d rows in set%s (truncated from %d)\n" (length rows) ws nrows)
-                    (format "%d %s in set%s\n" nrows (if (= nrows 1) "row" "rows") ws))
-                  'font-lock-face 'isqlm-info-face))))))))
+               (concat
+                (if vertical
+                    (let ((n 0))
+                      (mapconcat
+                       (lambda (row)
+                         (cl-incf n)
+                         (concat (format "*************************** %d. row ***************************\n" n)
+                                 (isqlm--format-vertical columns row) "\n"))
+                       rows ""))
+                  (isqlm--format-table columns rows))
+                (propertize
+                 (if truncated
+                     (format "%d rows in set%s (truncated from %d)\n" (length rows) ws nrows)
+                   (format "%d %s in set%s\n" nrows (if (= nrows 1) "row" "rows") ws))
+                 'font-lock-face 'isqlm-info-face)))))))
       ('dml
        (let ((affected (plist-get result :affected-rows)))
-         (isqlm--output
-          (propertize
-           (if (and (integerp affected) (>= affected 0))
-               (format "Query OK, %d %s affected%s\n"
-                       affected (if (= affected 1) "row" "rows") ws)
-             (format "Query OK%s\n" ws))
-           'font-lock-face 'isqlm-info-face))))
-      (_ (isqlm--output-error "*** Error *** Unknown result type\n")))))
+         (propertize
+          (if (and (integerp affected) (>= affected 0))
+              (format "Query OK, %d %s affected%s\n"
+                      affected (if (= affected 1) "row" "rows") ws)
+            (format "Query OK%s\n" ws))
+          'font-lock-face 'isqlm-info-face)))
+      (_ (error "Unknown result type")))))
+
+(defun isqlm--format-and-output-result (result sql mode)
+  "Format RESULT plist from `mysql-query' and output to buffer.
+SQL is the original statement, MODE is the terminator mode."
+  (let ((str (condition-case err
+                 (isqlm--format-result-string result mode)
+               (error
+                (isqlm--output-error
+                 (format "*** Error *** %s\n" (isqlm--error-message err)))
+                nil))))
+    (when (and str (not (string= str "")))
+      (isqlm--output str))))
 
 (defun isqlm--async-cancel ()
   "Cancel any in-progress async query."
@@ -1473,8 +1418,6 @@ When disabled, empty password is used."
     (if (isqlm--connected-p)
         (format "Connected: %s\n" (isqlm--format-connection-info))
       "Not connected.\n")
-    (format "Query mode: %s\n"
-            (if (isqlm--async-available-p) "async (non-blocking)" "sync (blocking)"))
     (format "Auto-reconnect: %s\n" (if isqlm-auto-reconnect "on" "off"))
     (format "Table style: %s\n" isqlm-table-style)
     (format "Password prompt: %s\n" (if isqlm-prompt-password "on" "off")))))
@@ -2240,21 +2183,8 @@ Otherwise, insert a continuation prompt for multi-line input."
         (isqlm--add-to-history accumulated)
         (setq isqlm-pending-input "")
         (let ((statements (isqlm--split-statements accumulated)))
-          (if (isqlm--async-available-p)
-              ;; Async path: execute statements one by one without blocking
-              (progn
-                (setq isqlm--async-busy t)
-                (isqlm--async-execute-statements statements isqlm-buf))
-            ;; Sync path (fallback when async API not available)
-            (dolist (stmt statements)
-              (condition-case err
-                  (let* ((expanded (isqlm--expand-sql-variables stmt))
-                         (result (isqlm--execute-sql expanded)))
-                    (isqlm--output result))
-                (error
-                 (when isqlm-noisy (ding))
-                 (isqlm--output-mysql-error err))))
-            (isqlm--emit-prompt))))))))))
+          (setq isqlm--async-busy t)
+          (isqlm--async-execute-statements statements isqlm-buf)))))))))
 
 ;; ============================================================
 ;; Interactive commands (for keybindings / M-x)
@@ -2457,10 +2387,7 @@ Type \\[describe-mode] for help.\n\
 Use `\\\\connect' or \\[isqlm-connect] to connect.\n\
 SQL statements must end with `;' or `\\\\G'.  Press RET to execute.\n\
 Type `\\\\help' for built-in commands.\n"
-             (format "Query mode: %s\n\n"
-                     (if (isqlm--async-available-p)
-                         "async (non-blocking)"
-                       "sync (blocking)"))))
+             "Query mode: async (non-blocking)\n\n"))
     (add-text-properties (point-min) (point)
                          '(read-only t rear-nonsticky t field output
                            inhibit-line-move-field-capture t))
