@@ -2202,14 +2202,29 @@ Otherwise, insert a continuation prompt for multi-line input."
 
 (defun isqlm-connect (&optional host user database port)
   "Connect to MySQL interactively or from Lisp.
+When called interactively:
+  - If `sql-connection-alist' is non-empty, prompt for a connection name
+    (like `isqlm-sql-connect').
+  - Otherwise, use default parameters.
+Ensures an ISQLM buffer exists before connecting.
 PASSWORD is prompted via echo area when `isqlm-prompt-password' is non-nil."
   (interactive)
-  (let ((args nil))
-    (when port (push (number-to-string port) args))
-    (when database (push database args))
-    (when user (push user args))
-    (when host (push host args))
-    (apply #'isqlm/connect args)))
+  (if (and (called-interactively-p 'any)
+           (boundp 'sql-connection-alist)
+           sql-connection-alist)
+      ;; Prompt for connection name
+      (let ((name (completing-read "Connection: "
+                                   (mapcar #'car sql-connection-alist) nil t)))
+        (isqlm-sql-connect name))
+    ;; Positional args or defaults
+    (unless (derived-mode-p 'isqlm-mode)
+      (isqlm))
+    (let ((args nil))
+      (when port (push (number-to-string port) args))
+      (when database (push database args))
+      (when user (push user args))
+      (when host (push host args))
+      (apply #'isqlm/connect args))))
 
 (defun isqlm-disconnect ()
   "Disconnect from MySQL."
@@ -2427,10 +2442,10 @@ Type `\\help' at the prompt for built-in commands.
     (insert (substitute-command-keys
              "*** Welcome to ISQLM — Interactive SQL Mode for MySQL ***\n\
 Type \\[describe-mode] for help.\n\
-Use `\\\\connect' or \\[isqlm-connect] to connect.\n\
-SQL statements must end with `;' or `\\\\G'.  Press RET to execute.\n\
-Type `\\\\help' for built-in commands.\n"
-             "Query mode: async (non-blocking)\n\n"))
+Use `\\=\\connect' or \\[isqlm-connect] to connect.\n\
+SQL statements must end with `;' or `\\=\\G'.  Press RET to execute.\n\
+Type `\\=\\help' for built-in commands.\n\
+Query mode: async (non-blocking)\n\n"))
     (add-text-properties (point-min) (point)
                          '(read-only t rear-nonsticky t field output
                            inhibit-line-move-field-capture t))

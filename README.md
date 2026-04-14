@@ -54,7 +54,7 @@ Build and install `mysql-el` so that `(require 'mysql-el)` works.  See the
 ```elisp
 (use-package isqlm
   :straight (:host github :repo "swida/isqlm")
-  :commands (isqlm isqlm-sql-connect isqlm-connect-and-run))
+  :commands (isqlm isqlm-connect isqlm-sql-connect isqlm-connect-and-run))
 ```
 
 ### Option C: use-package + vc (Emacs 30+)
@@ -62,7 +62,7 @@ Build and install `mysql-el` so that `(require 'mysql-el)` works.  See the
 ```elisp
 (use-package isqlm
   :vc (:url "https://github.com/swida/isqlm")
-  :commands (isqlm isqlm-sql-connect isqlm-connect-and-run))
+  :commands (isqlm isqlm-connect isqlm-sql-connect isqlm-connect-and-run))
 ```
 
 ### Option D: Manual with autoload (lazy loading)
@@ -419,6 +419,7 @@ A `*isqlm-script*` buffer opens with `sql-mode` syntax highlighting. Write your 
 | Command | Description |
 |---------|-------------|
 | `M-x isqlm` | Open `*isqlm*` buffer |
+| `M-x isqlm-connect` | Connect: prompts for `sql-connection-alist` entry if available, otherwise uses defaults |
 | `M-x isqlm-sql-connect` | Select from `sql-connection-alist` with completion, open `*isqlm:NAME*` |
 | `M-x isqlm-connect-and-run` | Open buffer and connect with Lisp arguments |
 

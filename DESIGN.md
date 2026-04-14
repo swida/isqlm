@@ -534,6 +534,7 @@ All options belong to the `isqlm` customize group:
 ## 12. Entry Points
 
 - `M-x isqlm` — Create/switch to `*isqlm*` buffer
+- `M-x isqlm-connect` — Connect: if `sql-connection-alist` is non-empty, prompt for name with completion; otherwise ensure ISQLM buffer and connect with defaults.  From Lisp: `(isqlm-connect HOST USER DB PORT)`
 - `M-x isqlm-sql-connect` — Select from `sql-connection-alist` with completion, open `*isqlm:NAME*`
 - `M-x isqlm-connect-and-run` — Start and immediately connect
 - `\connect NAME` at the prompt — Connect using a `sql-connection-alist` entry
