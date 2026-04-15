@@ -185,7 +185,7 @@ Each element is a plist (:satisfied BOOL :active BOOL :depth-skip INT).
 (defvar-local isqlm--async-state nil
   "Non-nil when an asynchronous query is in progress.
 Plist with keys:
-  :phase    — 'query or 'store (which async step we're in)
+  :phase    — \\='query or \\='store (which async step we are in)
   :sql      — the original SQL string
   :query    — the stripped query (no terminator)
   :mode     — terminator mode (nil, t for \\G, or (:gset PREFIX))
@@ -956,24 +956,24 @@ Connection check and auto-reconnect are delegated to `isqlm-execute-string'."
     (when (string= query "")
       (error "Empty query"))
     ;; USE: execute + update connection-info and mode-line
-    (when (string-prefix-p "USE" upper)
-      (isqlm-execute-string query)
-      (let ((db-name (string-trim
-                      (replace-regexp-in-string "\\`USE\\s-+" "" query))))
-        (setq db-name (replace-regexp-in-string "[`'\"]" "" db-name))
-        (plist-put isqlm-connection-info :database db-name)
-        (setq mode-line-process
-              (list (format " [%s]" (isqlm--format-connection-info))))
-        (force-mode-line-update)
-        (cl-return-from isqlm--execute-sql
-          (propertize (format "Database changed to: %s\n" db-name)
-                      'font-lock-face 'isqlm-info-face))))
-    ;; All other SQL
-    (let ((result (isqlm-execute-string query)))
-      (isqlm--format-result-string result mode))))
+    (if (string-prefix-p "USE" upper)
+        (progn
+          (isqlm-execute-string query)
+          (let ((db-name (string-trim
+                          (replace-regexp-in-string "\\`USE\\s-+" "" query))))
+            (setq db-name (replace-regexp-in-string "[`'\"]" "" db-name))
+            (plist-put isqlm-connection-info :database db-name)
+            (setq mode-line-process
+                  (list (format " [%s]" (isqlm--format-connection-info))))
+            (force-mode-line-update)
+            (propertize (format "Database changed to: %s\n" db-name)
+                        'font-lock-face 'isqlm-info-face)))
+      ;; All other SQL
+      (let ((result (isqlm-execute-string query)))
+        (isqlm--format-result-string result mode)))))
 
 (defun isqlm-execute-string (sql)
-  "Execute SQL on the current ISQLM connection and return a result plist.
+  "Execute SQL on the current ISQLM connection, return a result plist.
 
 This is the public API for programmatic SQL execution.  It abstracts
 the underlying database module so that callers do not depend on
@@ -981,7 +981,8 @@ the underlying database module so that callers do not depend on
 
 The returned plist has one of the following shapes:
 
-  SELECT: (:type select :columns (\"col\" ...) :rows ((val ...) ...) :warning-count N)
+  SELECT: (:type select :columns (\"col\" ...)
+           :rows ((val ...) ...) :warning-count N)
   DML:    (:type dml :affected-rows N :warning-count N)
 
 Signals `mysql-error' (or `error') on failure.
@@ -1171,9 +1172,9 @@ Returns the formatted string, or \"\" for \\gset."
           'font-lock-face 'isqlm-info-face)))
       (_ (error "Unknown result type")))))
 
-(defun isqlm--format-and-output-result (result sql mode)
+(defun isqlm--format-and-output-result (result _sql mode)
   "Format RESULT plist from `mysql-query' and output to buffer.
-SQL is the original statement, MODE is the terminator mode."
+_SQL is the original statement (unused), MODE is the terminator mode."
   (let ((str (condition-case err
                  (isqlm--format-result-string result mode)
                (error
@@ -1971,8 +1972,9 @@ E.g. \\? and \\h both map to \\help.")
     str))
 
 (defun isqlm--expand-arg (arg)
-  "Expand ARG: if it starts with `:' treat it as an Emacs variable reference.
-`:varname' → value of varname.  Otherwise return ARG as-is (with numeric coercion)."
+  "Expand ARG: if it starts with `:' treat as a variable reference.
+`:varname' expands to the value of varname.  Otherwise return ARG
+as-is (with numeric coercion)."
   (if (and (stringp arg) (string-prefix-p ":" arg) (> (length arg) 1))
       (let ((sym (intern-soft (substring arg 1))))
         (if (and sym (boundp sym))
