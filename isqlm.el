@@ -865,14 +865,11 @@ each data row into multiple display lines."
       (dotimes (i (min ncols (length row)))
         (setf (nth i widths)
               (max (nth i widths) (isqlm--display-width (nth i row))))))
-    ;; Apply max-column-width limit (0 = no limit, use window width as fallback)
-    (let ((effective-max (if (and isqlm-max-column-width
-                                 (> isqlm-max-column-width 0))
-                            isqlm-max-column-width
-                          (max 20 (- (window-width) (* ncols 3) 2)))))
+    ;; Apply max-column-width limit (0 = no limit)
+    (when (and isqlm-max-column-width (> isqlm-max-column-width 0))
       (dotimes (i ncols)
         (setf (nth i widths)
-              (min effective-max (nth i widths)))))
+              (min isqlm-max-column-width (nth i widths)))))
     (let* ((top-sep (isqlm--make-separator
                      widths
                      (plist-get chars :top-left)
@@ -2414,6 +2411,7 @@ Type `\\help' at the prompt for built-in commands.
   (setq isqlm-prompt-internal (or isqlm-prompt "SQL> "))
   (setq isqlm-pending-input "")
   (setq mode-line-process '(" [disconnected]"))
+  (setq truncate-lines t)
   ;; Markers
   (setq isqlm-last-input-start  (point-min-marker))
   (setq isqlm-last-input-end    (point-min-marker))
