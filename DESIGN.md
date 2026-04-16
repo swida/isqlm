@@ -260,10 +260,10 @@ Inspired by PostgreSQL's `psql` meta-commands. Uses a stack-based approach:
 
 ## 5. SQL Execution Layer
 
-All SQL execution goes through `mysql-query` (the unified sync/async API from `mysql-el`). There are two execution paths:
+All SQL execution uses `mysql-query` with `ASYNC=t` (non-blocking).  **No sync `mysql-query` calls remain** — Emacs is never blocked by network I/O.  There are two execution styles:
 
-1. **Interactive prompt** (`isqlm-send-input`) — always uses the **async** path: `mysql-query conn sql t` (ASYNC=t) → `mysql-query-poll` via timer
-2. **Scripts, for-loops, quick-sql, send-region** — use the **sync** path via `isqlm--execute-sql`
+1. **Timer-based async** (interactive prompt, scripts, for-loops, quick-sql, send-region) — `mysql-query conn sql t` → `mysql-query-poll` via `run-with-timer`, with callback chaining for multi-statement and script execution
+2. **Poll-loop async** (`isqlm-execute-string`, `isqlm-execute`) — `mysql-query conn sql t` → `mysql-query-poll` via `sit-for` loop, returning the result plist synchronously to the caller while keeping Emacs responsive
 
 Both paths share `isqlm--format-result-string` for result formatting (table display, vertical display, `\gset`, row counts, warnings), eliminating duplicate formatting logic.
 
@@ -271,12 +271,16 @@ Both paths share `isqlm--format-result-string` for result formatting (table disp
 
 | Function | Role |
 |----------|------|
-| `isqlm-execute-string` | **Public API**: execute SQL, return result plist; connection check + auto-reconnect |
-| `isqlm--execute-sql` | Internal: terminator parsing + USE side-effects + `isqlm--format-result-string`; delegates to `isqlm-execute-string` |
+| `isqlm-execute-string` | **Public API**: execute SQL, return result plist; uses async+poll internally |
+| `isqlm--query-with-poll` | async `mysql-query` + `sit-for` poll loop; non-blocking |
+| `isqlm--execute-sql` | Internal: terminator parsing + USE side-effects + `isqlm--format-result-string` |
 | `isqlm--format-result-string` | **Shared**: format result plist into a string (SELECT/DML/\gset) |
 | `isqlm--format-and-output-result` | Thin wrapper: calls `isqlm--format-result-string` and outputs to buffer |
-| `isqlm--async-execute-one` | Async core: `mysql-query conn sql t` → immediate or poll |
-| `isqlm--poll-query` | Timer callback: `mysql-query-poll` → `isqlm--format-and-output-result` |
+| `isqlm--async-execute-one` | Timer-based async: `mysql-query conn sql t` → immediate or poll timer |
+| `isqlm--async-handle-result` | Handle completed result: USE side-effects or format+output |
+| `isqlm--poll-query` | Timer callback: `mysql-query-poll` → `isqlm--async-handle-result` |
+| `isqlm--async-run-statements` | Chain multiple statements via callbacks (used by scripts/for-loops) |
+| `isqlm--script-process-lines` | Async script executor: line-by-line with callback chaining |
 
 ### Auto-Reconnect
 
@@ -334,7 +338,7 @@ isqlm--do-connect
 6. **C-c C-c cancellation**: `isqlm-interrupt` calls `isqlm--async-cancel` which cancels the polling timer
 7. **USE statements**: Handled synchronously in both paths (fast, no result set)
 8. **Multi-statement**: Statements are chained via callbacks — each statement's completion triggers the next
-9. **Sync path**: Scripts (`\i`), for-loops (`\for`), quick-sql (`C-c C-t`, `isqlm-send-region`), and auto-reconnect retry use `isqlm--execute-sql` → `isqlm-execute-string` (sync `mysql-query`)
+9. **Fully non-blocking**: All paths use `mysql-query` with `ASYNC=t` — scripts, for-loops, quick-sql, send-region all use callback-chained async execution; `isqlm-execute-string` uses `sit-for`-based polling
 
 **Core functions:**
 

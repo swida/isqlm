@@ -979,6 +979,9 @@ This is the public API for programmatic SQL execution.  It abstracts
 the underlying database module so that callers do not depend on
 `mysql-el' directly.
 
+The query is sent asynchronously and polled with `sit-for', so Emacs
+remains responsive even for slow queries.
+
 The returned plist has one of the following shapes:
 
   SELECT: (:type select :columns (\"col\" ...)
@@ -993,15 +996,24 @@ Auto-reconnect is attempted if `isqlm-auto-reconnect' is non-nil."
     (unless (isqlm--try-auto-reconnect)
       (error "Not connected.  Use `\\connect' or M-x isqlm-connect")))
   (condition-case err
-      (mysql-query isqlm-connection sql)
+      (isqlm--query-with-poll sql)
     (error
      (if (and isqlm-auto-reconnect
               isqlm-connection-info
               (isqlm--connection-lost-p err))
          (if (isqlm--try-auto-reconnect)
-             (mysql-query isqlm-connection sql)
+             (isqlm--query-with-poll sql)
            (signal (car err) (cdr err)))
        (signal (car err) (cdr err))))))
+
+(defun isqlm--query-with-poll (sql)
+  "Execute SQL via async `mysql-query' and poll until complete.
+Returns the result plist.  Uses `sit-for' so Emacs stays responsive."
+  (let ((result (mysql-query isqlm-connection sql t)))
+    (while (eq result 'not-ready)
+      (sit-for 0.02)
+      (setq result (mysql-query-poll isqlm-connection)))
+    result))
 
 ;; ============================================================
 ;; Async SQL Execution (non-blocking, via mysql-query / mysql-query-poll)
@@ -1028,6 +1040,23 @@ result is output.  When all statements finish, emit a prompt."
            (lambda ()
              (isqlm--async-execute-statements rest buffer))))))))
 
+(defun isqlm--async-run-statements (statements buffer callback)
+  "Execute STATEMENTS asynchronously, then call CALLBACK.
+Like `isqlm--async-execute-statements' but does not manage
+`isqlm--async-busy' or emit a prompt.  Used by scripts, for-loops,
+and other internal callers that chain multiple lines."
+  (if (null statements)
+      (when callback (funcall callback))
+    (let* ((stmt (car statements))
+           (rest (cdr statements))
+           (expanded (isqlm--expand-sql-variables stmt)))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (isqlm--async-execute-one
+           expanded buffer
+           (lambda ()
+             (isqlm--async-run-statements rest buffer callback))))))))
+
 (defun isqlm--async-execute-one (sql buffer callback)
   "Execute a single SQL statement asynchronously.
 SQL is the expanded statement.  BUFFER is the isqlm buffer.
@@ -1043,45 +1072,77 @@ CALLBACK is called (with no args) when this statement completes."
           (isqlm--output-error "*** Error *** Empty query\n")
           (funcall callback)
           (throw 'done nil))
-        ;; USE is handled synchronously (fast, no result set)
-        (when (string-prefix-p "USE" upper)
-          (condition-case err
-              (isqlm--output (isqlm--execute-sql sql))
-            (error
-             (when isqlm-noisy (ding))
-             (isqlm--output-mysql-error err)))
-          (funcall callback)
-          (throw 'done nil))
-        ;; Start async query via mysql-query
+        ;; Start async query via mysql-query (including USE)
         (condition-case err
             (let ((result (mysql-query isqlm-connection query t)))
               (if (not (eq result 'not-ready))
-                  ;; Completed immediately — process result plist
+                  ;; Completed immediately — process result
                   (progn
-                    (isqlm--format-and-output-result result sql mode)
+                    (isqlm--async-handle-result result sql query mode
+                                               upper buffer callback)
                     (funcall callback))
                 ;; Not ready — poll with timer
                 (setq isqlm--async-state
                       (list :phase 'query :sql sql :query query
-                            :mode mode :callback callback
+                            :mode mode :upper upper :callback callback
                             :timer (run-with-timer
                                     0.02 0.02
                                     #'isqlm--poll-query buffer)))))
           (error
-           ;; Connection lost? Try auto-reconnect + fall back to sync
+           ;; Connection lost? Try auto-reconnect + retry async
            (if (and isqlm-auto-reconnect
                     isqlm-connection-info
                     (isqlm--connection-lost-p err))
-               (when (isqlm--try-auto-reconnect)
-                 (condition-case err2
-                     (isqlm--output (isqlm--execute-sql sql))
-                   (error
-                    (when isqlm-noisy (ding))
-                    (isqlm--output-mysql-error err2)))
+               (if (isqlm--try-auto-reconnect)
+                   ;; Retry the query asynchronously after reconnect
+                   (condition-case err2
+                       (let ((result (mysql-query isqlm-connection query t)))
+                         (if (not (eq result 'not-ready))
+                             (progn
+                               (isqlm--async-handle-result
+                                result sql query mode upper buffer callback)
+                               (funcall callback))
+                           (setq isqlm--async-state
+                                 (list :phase 'query :sql sql :query query
+                                       :mode mode :upper upper
+                                       :callback callback
+                                       :timer (run-with-timer
+                                               0.02 0.02
+                                               #'isqlm--poll-query buffer)))))
+                     (error
+                      (when isqlm-noisy (ding))
+                      (isqlm--output-mysql-error err2)
+                      (funcall callback)))
+                 ;; Reconnect failed
+                 (when isqlm-noisy (ding))
+                 (isqlm--output-mysql-error err)
                  (funcall callback))
+             ;; Not a connection-lost error
              (when isqlm-noisy (ding))
              (isqlm--output-mysql-error err)
              (funcall callback))))))))
+
+(defun isqlm--async-handle-result (result sql query mode upper
+                                          _buffer _callback)
+  "Handle a completed async RESULT for QUERY.
+SQL is the original statement with terminator.  UPPER is the uppercased
+query.  MODE is the terminator mode.
+Handles USE side-effects; for other statements, formats and
+outputs the result."
+  (if (string-prefix-p "USE" upper)
+      ;; USE: update connection-info + mode-line
+      (let ((db-name (string-trim
+                      (replace-regexp-in-string "\\`USE\\s-+" "" query))))
+        (setq db-name (replace-regexp-in-string "[`'\"]" "" db-name))
+        (plist-put isqlm-connection-info :database db-name)
+        (setq mode-line-process
+              (list (format " [%s]" (isqlm--format-connection-info))))
+        (force-mode-line-update)
+        (isqlm--output
+         (propertize (format "Database changed to: %s\n" db-name)
+                     'font-lock-face 'isqlm-info-face)))
+    ;; Normal result
+    (isqlm--format-and-output-result result sql mode)))
 
 (defun isqlm--poll-query (buffer)
   "Timer callback: poll async query progress via mysql-query-poll."
@@ -1094,11 +1155,14 @@ CALLBACK is called (with no args) when this statement completes."
                 ;; Query complete — cancel timer and process result
                 (let ((timer (plist-get isqlm--async-state :timer))
                       (sql (plist-get isqlm--async-state :sql))
+                      (query (plist-get isqlm--async-state :query))
                       (mode (plist-get isqlm--async-state :mode))
+                      (upper (plist-get isqlm--async-state :upper))
                       (callback (plist-get isqlm--async-state :callback)))
                   (when timer (cancel-timer timer))
                   (setq isqlm--async-state nil)
-                  (isqlm--format-and-output-result result sql mode)
+                  (isqlm--async-handle-result result sql query mode
+                                              upper buffer callback)
                   (when callback (funcall callback)))))
           (error
            (let ((timer (plist-get isqlm--async-state :timer))
@@ -1468,72 +1532,92 @@ Examples:
          (isqlm--output-error
           (format "*** Eval Error *** %s\n" (isqlm--error-message err))))))))
 
-(defun isqlm--execute-line (line)
+(defun isqlm--execute-line (line &optional callback)
   "Execute LINE as if typed at the prompt.
-Handles built-in commands, complete SQL, and multi-statement input."
-  (let ((trimmed (string-trim line)))
-    (when (> (length trimmed) 0)
+Handles built-in commands, complete SQL, and multi-statement input.
+When CALLBACK is non-nil, it is called after execution completes
+\(used by script and for-loop execution to chain lines)."
+  (let ((trimmed (string-trim line))
+        (buf (current-buffer)))
+    (if (= (length trimmed) 0)
+        (when callback (funcall callback))
       (cond
        ;; Built-in command
        ((string-prefix-p "\\" trimmed)
-        (isqlm--try-builtin-command trimmed))
-       ;; Complete SQL
+        (isqlm--try-builtin-command trimmed)
+        (when callback (funcall callback)))
+       ;; Complete SQL — execute asynchronously
        ((isqlm--sql-complete-p trimmed)
         (let ((statements (isqlm--split-statements trimmed)))
-          (dolist (stmt statements)
-            (condition-case err
-                (let* ((expanded (isqlm--expand-sql-variables stmt))
-                       (result (isqlm--execute-sql expanded)))
-                  (isqlm--output result))
-              (error
-               (when isqlm-noisy (ding))
-               (isqlm--output-mysql-error err))))))
+          (isqlm--async-run-statements
+           statements buf
+           (or callback #'ignore))))
        ;; Incomplete SQL — warning
        (t
         (isqlm--output-error
-         (format "Incomplete statement: %s\n" trimmed)))))))
+         (format "Incomplete statement: %s\n" trimmed))
+        (when callback (funcall callback)))))))
 
 (defun isqlm--execute-script (text)
-  "Execute TEXT as a script — each line processed as if typed at the prompt.
+  "Execute TEXT as a script asynchronously.
 Multi-line SQL is accumulated until a terminator is found.
-Respects \\if/\\elif/\\else/\\endif conditional flow."
-  (let ((pending ""))
-    (dolist (line (split-string text "\n"))
-      (setq pending (concat pending
-                            (if (string= pending "") "" "\n")
-                            line))
-      (let ((trimmed (string-trim pending)))
-        (cond
-         ;; Built-in command on its own line (no multi-line pending)
-         ((and (not (string-match-p "\n" pending))
-               (string-prefix-p "\\" trimmed))
+Respects \\if/\\elif/\\else/\\endif conditional flow.
+Each SQL statement is executed via the async pipeline."
+  (let ((lines (split-string text "\n"))
+        (buf (current-buffer)))
+    (isqlm--script-process-lines lines "" buf)))
+
+(defun isqlm--script-process-lines (lines pending buf)
+  "Process LINES from a script with PENDING accumulated input in BUF.
+Async: when a SQL statement is found, execute it and continue
+processing remaining lines in the callback."
+  (if (null lines)
+      ;; End of script — check for unterminated input
+      (when (> (length (string-trim pending)) 0)
+        (when (buffer-live-p buf)
+          (with-current-buffer buf
+            (when (isqlm--cond-active-p)
+              (isqlm--output-error
+               (format "Unterminated statement at end of script: %s\n"
+                       (string-trim pending)))))))
+    (let* ((line (car lines))
+           (rest (cdr lines))
+           (new-pending (concat pending
+                                (if (string= pending "") "" "\n")
+                                line))
+           (trimmed (string-trim new-pending)))
+      (when (buffer-live-p buf)
+        (with-current-buffer buf
           (cond
-           ;; Conditional flow commands — always process
-           ((isqlm--cond-flow-command-p trimmed)
-            (isqlm--process-cond-flow trimmed))
-           ;; Other commands — only when active
-           ((isqlm--cond-active-p)
-            (isqlm--execute-line pending)))
-          (setq pending ""))
-         ;; Complete SQL — execute only when active
-         ((isqlm--sql-complete-p pending)
-          (when (isqlm--cond-active-p)
-            (let ((statements (isqlm--split-statements pending)))
-              (dolist (stmt statements)
-                (condition-case err
-                    (let* ((expanded (isqlm--expand-sql-variables stmt))
-                           (result (isqlm--execute-sql expanded)))
-                      (isqlm--output result))
-                  (error
-                   (when isqlm-noisy (ding))
-                   (isqlm--output-mysql-error err))))))
-          (setq pending "")))))
-    ;; Remaining unterminated input
-    (when (> (length (string-trim pending)) 0)
-      (when (isqlm--cond-active-p)
-        (isqlm--output-error
-         (format "Unterminated statement at end of script: %s\n"
-                 (string-trim pending)))))))
+           ;; Built-in command on its own line (no multi-line pending)
+           ((and (not (string-match-p "\n" new-pending))
+                 (string-prefix-p "\\" trimmed))
+            (cond
+             ;; Conditional flow commands — always process, then continue
+             ((isqlm--cond-flow-command-p trimmed)
+              (isqlm--process-cond-flow trimmed)
+              (isqlm--script-process-lines rest "" buf))
+             ;; Other commands — only when active (async via callback)
+             ((isqlm--cond-active-p)
+              (isqlm--execute-line
+               new-pending
+               (lambda ()
+                 (isqlm--script-process-lines rest "" buf))))
+             ;; Inactive — skip command, continue
+             (t
+              (isqlm--script-process-lines rest "" buf))))
+           ;; Complete SQL — execute only when active
+           ((isqlm--sql-complete-p new-pending)
+            (if (isqlm--cond-active-p)
+                (let ((statements (isqlm--split-statements new-pending)))
+                  (isqlm--async-run-statements
+                   statements buf
+                   (lambda ()
+                     (isqlm--script-process-lines rest "" buf))))
+              (isqlm--script-process-lines rest "" buf)))
+           ;; Incomplete — accumulate and continue
+           (t
+            (isqlm--script-process-lines rest new-pending buf))))))))
 
 ;; Minor mode for \i - editing buffer
 (defvar-local isqlm--script-target nil
@@ -1894,11 +1978,27 @@ Handle nested { } and detect the closing }."
 
 (defun isqlm--for-execute-body (var values body)
   "Execute BODY lines for each value in VALUES, binding VAR.
-Each line is processed as if typed at the prompt."
-  (dolist (val values)
-    (set var val)
-    (dolist (line body)
-      (isqlm--execute-line line))))
+Each line is executed asynchronously via `isqlm--execute-line'."
+  (isqlm--for-iterate var values body))
+
+(defun isqlm--for-iterate (var values body)
+  "Iterate: bind VAR to (car VALUES), run BODY lines, then recurse."
+  (if (null values)
+      nil  ; done
+    (set var (car values))
+    (isqlm--for-run-lines
+     body var (cdr values) body)))
+
+(defun isqlm--for-run-lines (lines var remaining-values all-body)
+  "Run LINES one by one (async), then iterate to next value."
+  (if (null lines)
+      ;; This iteration done — proceed to next value
+      (isqlm--for-iterate var remaining-values all-body)
+    (isqlm--execute-line
+     (car lines)
+     (lambda ()
+       (isqlm--for-run-lines
+        (cdr lines) var remaining-values all-body)))))
 
 (defconst isqlm--cond-flow-commands '("if" "elif" "else" "endif")
   "List of conditional flow command names.")
@@ -2282,15 +2382,13 @@ If an async query is in progress, cancel it."
   (isqlm--quick-sql (format "DESCRIBE `%s`;" table)))
 
 (defun isqlm--quick-sql (sql)
-  "Execute SQL directly, showing both the command and result."
+  "Execute SQL directly via the async path, showing the command and result."
   (unless (isqlm--connected-p)
     (user-error "Not connected to MySQL"))
   (isqlm--output (concat sql "\n"))
-  (condition-case err
-      (isqlm--output (isqlm--execute-sql sql))
-    (error
-     (isqlm--output-mysql-error err)))
-  (isqlm--emit-prompt))
+  (setq isqlm--async-busy t)
+  (isqlm--async-execute-statements
+   (isqlm--split-statements sql) (current-buffer)))
 
 ;; ============================================================
 ;; Send from external buffers (à la sql-send-string)
