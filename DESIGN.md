@@ -182,7 +182,8 @@ This expansion happens after statement splitting and before `isqlm--execute-sql`
 | `\password` | `isqlm/password` | Toggle password prompting |
 | `\use` | `isqlm/use` | Switch database |
 | `\status` | `isqlm/status` | Show connection status |
-| `\style` | `isqlm/style` | Toggle/set table border style |
+| `\linestyle` | `isqlm/linestyle` | Set/cycle line-drawing style (ascii/unicode/none) |
+| `\timing` | `isqlm/timing` | Toggle/set query execution timing display |
 | `\eval` | `isqlm/eval` | Evaluate arbitrary Elisp expression |
 | `\echo` | `isqlm/echo` | Output text with variable expansion |
 | `\for` | `isqlm--for-start` | Loop over values with `{ body }` |
@@ -447,16 +448,17 @@ All output is written to the buffer through three functions:
 - **Vertical mode** (`isqlm--format-vertical`): Triggered when SQL ends with `\G`, one field per line
 - Row count capped by `isqlm-max-rows` (0 = unlimited)
 
-### Table Styles
+### Line Styles
 
-Controlled by `isqlm-table-style` (toggle via `\style` command):
+Controlled by `isqlm-table-style` (set via `\linestyle` command, unique abbreviations allowed):
 
 | Style | Characters | Example |
 |-------|-----------|---------|
-| `ascii` (default) | `+ - \|` | `+----+------+` |
-| `unicode` | `┌┬┐├┼┤└┴┘│─` | `┌────┬──────┐` |
+| `ascii` | `+ - \|` | `+----+------+` |
+| `unicode` (default) | `┌┬┐├┼┤└┴┘│─` | `┌────┬──────┐` |
+| `none` | (no borders) | ` id  name ` |
 
-Character sets are defined in `isqlm--table-chars-ascii` and `isqlm--table-chars-unicode`.
+Character sets are defined in `isqlm--table-chars-ascii`, `isqlm--table-chars-unicode`, and `isqlm--table-chars-none`.
 
 ### Multi-line Cell Values
 
@@ -512,7 +514,7 @@ All options belong to the `isqlm` customize group:
 | `isqlm-prompt-continue` | `"  -> "` | Continuation prompt |
 | `isqlm-prompt-read-only` | `t` | Whether prompt is read-only |
 | `isqlm-noisy` | `t` | Beep on errors |
-| `isqlm-table-style` | `unicode` | Table border style (`ascii` / `unicode`) |
+| `isqlm-table-style` | `unicode` | Line style (`ascii` / `unicode` / `none`) |
 | `isqlm-history-file-name` | `~/.emacs.d/isqlm-history` | History file |
 | `isqlm-history-size` | `512` | History capacity |
 | `isqlm-default-host` | `"127.0.0.1"` | Default host |

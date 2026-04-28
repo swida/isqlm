@@ -29,6 +29,7 @@ through the [`mysql-el`](https://github.com/swida/mysql-el) dynamic module (C FF
 - **Variable references** — use `:varname` in command args to reference Emacs variables
 - **MySQL-client error format** — errors display as `ERROR 1690 (22003): BIGINT value is out of range...` (same as the `mysql` CLI), with structured error data from `mysql-el`'s `mysql-error` signal
 - **Warning count display** — query results show warnings like `1 row in set, 2 warnings`
+- **Execution timing** — `\timing` toggles display of query execution time (milliseconds, with human-readable breakdown for long queries)
 
 ## Requirements
 
@@ -163,13 +164,14 @@ If `sql-password` is omitted from a connection entry, you will be prompted for i
 ;; password will be prompted in echo area if isqlm-prompt-password is non-nil
 ```
 
-### Table Styles
+### Line Styles
 
-Toggle between ASCII and Unicode box-drawing borders:
+Set the border line-drawing style with `\linestyle` (unique abbreviations allowed: `a`, `u`, `n`).
+Without argument, cycles through ascii → unicode → none:
 
 ```
-SQL> \style unicode
-Table style: unicode
+SQL> \linestyle u
+Line style: unicode
 SQL> SELECT * FROM users LIMIT 2;
 ┌────┬───────┬───────────────────┐
 │ id │ name  │ email             │
@@ -177,6 +179,14 @@ SQL> SELECT * FROM users LIMIT 2;
 │ 1  │ Alice │ alice@example.com │
 │ 2  │ Bob   │ bob@example.com   │
 └────┴───────┴───────────────────┘
+2 rows in set
+
+SQL> \linestyle n
+Line style: none
+SQL> SELECT * FROM users LIMIT 2;
+ id  name   email
+ 1   Alice  alice@example.com
+ 2   Bob    bob@example.com
 2 rows in set
 ```
 
@@ -194,7 +204,8 @@ All built-in commands are prefixed with `\`:
 | `\password` | Toggle whether `\connect` prompts for a password |
 | `\use DATABASE` | Switch database |
 | `\status` | Show connection status |
-| `\style [ascii\|unicode]` | Toggle or set table border style |
+| `\linestyle [ascii\|unicode\|none]` | Set or cycle table border style (abbreviations: `a`, `u`, `n`) |
+| `\timing [on\|off]` | Toggle display of query execution time |
 | `\eval EXPRESSION` | Evaluate an Elisp expression |
 | `\clear` | Clear buffer |
 | `\history` | Show input history |
@@ -494,7 +505,7 @@ All options are in the `isqlm` customize group (`M-x customize-group RET isqlm`)
 |----------|---------|-------------|
 | `isqlm-prompt` | `"SQL> "` | Main prompt string |
 | `isqlm-prompt-continue` | `"  -> "` | Continuation prompt |
-| `isqlm-table-style` | `unicode` | Table borders: `ascii` or `unicode` |
+| `isqlm-table-style` | `unicode` | Line style: `ascii`, `unicode`, or `none` |
 | `isqlm-max-column-width` | `0` | Max column width (0 = auto/window width) |
 | `isqlm-max-rows` | `1000` | Max rows displayed (0 = unlimited) |
 | `isqlm-null-string` | `"NULL"` | Display string for NULL values |

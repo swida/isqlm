@@ -97,11 +97,13 @@ up to the current window width minus table borders."
   :type 'integer :group 'isqlm)
 
 (defcustom isqlm-table-style 'unicode
-  "Table border style for result display.
+  "Table border line-drawing style for result display.
 `ascii'   — classic MySQL style using +, -, |
-`unicode' — box-drawing characters ┌┬┐├┼┤└┴┘│─"
+`unicode' — box-drawing characters ┌┬┐├┼┤└┴┘│─
+`none'    — no borders"
   :type '(choice (const :tag "ASCII (+, -, |)" ascii)
-                 (const :tag "Unicode box-drawing" unicode))
+                 (const :tag "Unicode box-drawing" unicode)
+                 (const :tag "No borders" none))
   :group 'isqlm)
 
 (defcustom isqlm-max-rows 1000
@@ -195,6 +197,19 @@ Plist with keys:
 
 (defvar-local isqlm--async-busy nil
   "Non-nil when an async query is running.  Used to block new input.")
+
+(defvar-local isqlm-timing nil
+  "When non-nil, display execution time after each SQL statement.")
+
+(defun isqlm--format-timing (elapsed)
+  "Format ELAPSED seconds into a human-readable timing string.
+Returns e.g. \"Time: 42.531 ms\", \"Time: 1234.567 ms (1 s)\",
+\"Time: 65432.100 ms (1 min 5 s)\"."
+  (let ((ms (* elapsed 1000.0)))
+    (if (< ms 1000.0)
+        (format "Time: %.3f ms" ms)
+      (format "Time: %.3f ms (%s)" ms
+              (format-seconds "%dd %hh %mmin %ss%z" (round elapsed))))))
 
 ;; ============================================================
 ;; Font-lock
@@ -358,6 +373,7 @@ Checks for common MySQL error messages indicating server disconnect."
     (or (string-match-p "lost connection" msg)
         (string-match-p "server has gone away" msg)
         (string-match-p "connection was killed" msg)
+        (string-match-p "disconnected by the server" msg)
         (string-match-p "closed database" msg)
         (string-match-p "can't connect" msg)
         ;; Also detect when mysqlp fails (handle invalidated)
@@ -830,19 +846,30 @@ For multi-line strings, return the width of the longest line."
     :horizontal  "─" :vertical   "│")
   "Unicode box-drawing table characters.")
 
+(defconst isqlm--table-chars-none
+  '(:top-left    "" :top-mid    "" :top-right    ""
+    :mid-left    "" :mid-mid    "" :mid-right    ""
+    :bot-left    "" :bot-mid    "" :bot-right    ""
+    :horizontal  "" :vertical   "")
+  "No-border table characters.")
+
 (defun isqlm--table-chars ()
   "Return the active table character set based on `isqlm-table-style'."
-  (if (eq isqlm-table-style 'unicode)
-      isqlm--table-chars-unicode
-    isqlm--table-chars-ascii))
+  (pcase isqlm-table-style
+    ('unicode isqlm--table-chars-unicode)
+    ('none    isqlm--table-chars-none)
+    (_        isqlm--table-chars-ascii)))
 
 (defun isqlm--make-separator (widths left mid right horiz)
-  "Build a separator line: LEFT───MID───MID───RIGHT\\n."
-  (let ((h (aref horiz 0)))
-    (concat left
-            (mapconcat (lambda (w) (make-string (+ w 2) h))
-                       widths mid)
-            right "\n")))
+  "Build a separator line: LEFT───MID───MID───RIGHT\\n.
+Returns empty string when HORIZ is empty (none style)."
+  (if (string= horiz "")
+      ""
+    (let ((h (aref horiz 0)))
+      (concat left
+              (mapconcat (lambda (w) (make-string (+ w 2) h))
+                         widths mid)
+              right "\n"))))
 
 (defun isqlm--format-table (columns rows)
   "Format COLUMNS and ROWS as a textual table string.
@@ -1063,6 +1090,16 @@ SQL is the expanded statement.  BUFFER is the isqlm buffer.
 CALLBACK is called (with no args) when this statement completes."
   (with-current-buffer buffer
     (catch 'done
+      ;; Guard: if connection is nil, try auto-reconnect first
+      (unless isqlm-connection
+        (if (and isqlm-auto-reconnect
+                 isqlm-connection-info
+                 (isqlm--try-auto-reconnect))
+            nil  ; reconnected — fall through to execute
+          (isqlm--output-error
+           "Not connected.  Use `\\connect' or M-x isqlm-connect\n")
+          (funcall callback)
+          (throw 'done nil)))
       (let* ((parsed (isqlm--strip-terminator sql))
              (query (car parsed))
              (mode (cdr parsed))
@@ -1073,62 +1110,66 @@ CALLBACK is called (with no args) when this statement completes."
           (funcall callback)
           (throw 'done nil))
         ;; Start async query via mysql-query (including USE)
-        (condition-case err
-            (let ((result (mysql-query isqlm-connection query t)))
-              (if (not (eq result 'not-ready))
-                  ;; Completed immediately — process result
-                  (progn
-                    (isqlm--async-handle-result result sql query mode
-                                               upper buffer callback)
-                    (funcall callback))
-                ;; Not ready — poll with timer
-                (setq isqlm--async-state
-                      (list :phase 'query :sql sql :query query
-                            :mode mode :upper upper :callback callback
-                            :timer (run-with-timer
-                                    0.02 0.02
-                                    #'isqlm--poll-query buffer)))))
-          (error
-           ;; Connection lost? Try auto-reconnect + retry async
-           (if (and isqlm-auto-reconnect
-                    isqlm-connection-info
-                    (isqlm--connection-lost-p err))
-               (if (isqlm--try-auto-reconnect)
-                   ;; Retry the query asynchronously after reconnect
-                   (condition-case err2
-                       (let ((result (mysql-query isqlm-connection query t)))
-                         (if (not (eq result 'not-ready))
-                             (progn
-                               (isqlm--async-handle-result
-                                result sql query mode upper buffer callback)
-                               (funcall callback))
-                           (setq isqlm--async-state
-                                 (list :phase 'query :sql sql :query query
-                                       :mode mode :upper upper
-                                       :callback callback
-                                       :timer (run-with-timer
-                                               0.02 0.02
-                                               #'isqlm--poll-query buffer)))))
-                     (error
-                      (when isqlm-noisy (ding))
-                      (isqlm--output-mysql-error err2)
-                      (funcall callback)))
-                 ;; Reconnect failed
-                 (when isqlm-noisy (ding))
-                 (isqlm--output-mysql-error err)
-                 (funcall callback))
-             ;; Not a connection-lost error
-             (when isqlm-noisy (ding))
-             (isqlm--output-mysql-error err)
-             (funcall callback))))))))
+        (let ((start-time (current-time)))
+          (condition-case err
+              (let ((result (mysql-query isqlm-connection query t)))
+                (if (not (eq result 'not-ready))
+                    ;; Completed immediately — process result
+                    (progn
+                      (isqlm--async-handle-result result sql query mode
+                                                 upper start-time)
+                      (funcall callback))
+                  ;; Not ready — poll with timer
+                  (setq isqlm--async-state
+                        (list :phase 'query :sql sql :query query
+                              :mode mode :upper upper
+                              :start-time start-time :callback callback
+                              :timer (run-with-timer
+                                      0.02 0.02
+                                      #'isqlm--poll-query buffer)))))
+            (error
+             ;; Connection lost? Try auto-reconnect + retry async
+             (if (and isqlm-auto-reconnect
+                      isqlm-connection-info
+                      (isqlm--connection-lost-p err))
+                 (if (isqlm--try-auto-reconnect)
+                     ;; Retry the query asynchronously after reconnect
+                     (let ((retry-start (current-time)))
+                       (condition-case err2
+                           (let ((result (mysql-query isqlm-connection query t)))
+                             (if (not (eq result 'not-ready))
+                                 (progn
+                                   (isqlm--async-handle-result
+                                    result sql query mode upper retry-start)
+                                   (funcall callback))
+                               (setq isqlm--async-state
+                                     (list :phase 'query :sql sql :query query
+                                           :mode mode :upper upper
+                                           :start-time retry-start
+                                           :callback callback
+                                           :timer (run-with-timer
+                                                   0.02 0.02
+                                                   #'isqlm--poll-query buffer)))))
+                         (error
+                          (when isqlm-noisy (ding))
+                          (isqlm--output-mysql-error err2)
+                          (funcall callback)))
+                   ;; Reconnect failed
+                   (when isqlm-noisy (ding))
+                   (isqlm--output-mysql-error err)
+                   (funcall callback))
+               ;; Not a connection-lost error
+               (when isqlm-noisy (ding))
+               (isqlm--output-mysql-error err)
+               (funcall callback))))))))))
 
 (defun isqlm--async-handle-result (result sql query mode upper
-                                          _buffer _callback)
+                                          start-time)
   "Handle a completed async RESULT for QUERY.
 SQL is the original statement with terminator.  UPPER is the uppercased
-query.  MODE is the terminator mode.
+query.  MODE is the terminator mode.  START-TIME is the query start time.
 Handles USE side-effects; for other statements, formats and
-outputs the result."
+outputs the result.  Outputs timing info when `isqlm-timing' is non-nil."
   (if (string-prefix-p "USE" upper)
       ;; USE: update connection-info + mode-line
       (let ((db-name (string-trim
@@ -1142,7 +1183,13 @@ outputs the result."
          (propertize (format "Database changed to: %s\n" db-name)
                      'font-lock-face 'isqlm-info-face)))
     ;; Normal result
-    (isqlm--format-and-output-result result sql mode)))
+    (isqlm--format-and-output-result result sql mode))
+  ;; Timing
+  (when (and isqlm-timing start-time)
+    (isqlm--output-info
+     (concat (isqlm--format-timing
+              (float-time (time-subtract (current-time) start-time)))
+             "\n"))))
 
 (defun isqlm--poll-query (buffer)
   "Timer callback: poll async query progress via mysql-query-poll."
@@ -1158,11 +1205,12 @@ outputs the result."
                       (query (plist-get isqlm--async-state :query))
                       (mode (plist-get isqlm--async-state :mode))
                       (upper (plist-get isqlm--async-state :upper))
+                      (start-time (plist-get isqlm--async-state :start-time))
                       (callback (plist-get isqlm--async-state :callback)))
                   (when timer (cancel-timer timer))
                   (setq isqlm--async-state nil)
                   (isqlm--async-handle-result result sql query mode
-                                              upper buffer callback)
+                                              upper start-time)
                   (when callback (funcall callback)))))
           (error
            (let ((timer (plist-get isqlm--async-state :timer))
@@ -1281,7 +1329,8 @@ _SQL is the original statement (unused), MODE is the terminator mode."
     "  \\echo TEXT...          output text\n"
     "  \\clear                 clear buffer\n"
     "  \\history               show input history\n"
-    "  \\style [ascii|unicode] toggle/set table border style\n"
+    "  \\linestyle [a|u|n]     set border style (ascii/unicode/none)\n"
+    "  \\timing [on|off]       toggle query execution timing\n"
     "\n"
     "Control Flow\n"
     "  \\if EXPR               begin conditional block\n"
@@ -1371,7 +1420,12 @@ via the echo area.  Set it to nil with:
                                 (read-passwd "Password: ")
                               "")))
               (database (plist-get conn-info :database))
-              (port     (plist-get conn-info :port)))
+              (port     (plist-get conn-info :port))
+              (conn-name (car args)))
+          ;; Rename buffer to *isqlm: NAME*
+          (let ((new-name (format "*isqlm: <%s>*" conn-name)))
+            (unless (string= (buffer-name) new-name)
+              (rename-buffer new-name t)))
           (isqlm--do-connect host user password database port))
       ;; Connect with explicit positional args; all optional, defaults applied
       (let* ((host     (or (nth 0 args) isqlm-default-host))
@@ -1491,27 +1545,58 @@ When disabled, empty password is used."
         (format "Connected: %s\n" (isqlm--format-connection-info))
       "Not connected.\n")
     (format "Auto-reconnect: %s\n" (if isqlm-auto-reconnect "on" "off"))
-    (format "Table style: %s\n" isqlm-table-style)
+    (format "Line style: %s\n" isqlm-table-style)
+    (format "Timing: %s\n" (if isqlm-timing "on" "off"))
     (format "Password prompt: %s\n" (if isqlm-prompt-password "on" "off")))))
 
-(defun isqlm/style (&rest args)
-  "Toggle or set table style.  ARGS: [ascii|unicode].
-Without argument, toggle between ascii and unicode."
+(defun isqlm/linestyle (&rest args)
+  "Set or cycle the table border line-drawing style.
+ARGS: [ascii|unicode|none] (unique abbreviations allowed: a, u, n).
+Without argument, cycle ascii → unicode → none → ascii."
+  (let ((arg (car args)))
+    (if (null arg)
+        ;; Cycle: ascii → unicode → none → ascii
+        (progn
+          (setq isqlm-table-style
+                (pcase isqlm-table-style
+                  ('ascii 'unicode)
+                  ('unicode 'none)
+                  (_ 'ascii)))
+          (isqlm--output-info
+           (format "Line style: %s\n" isqlm-table-style)))
+      (let ((s (downcase arg)))
+        (cond
+         ((string-prefix-p s "ascii")
+          (setq isqlm-table-style 'ascii)
+          (isqlm--output-info "Line style: ascii\n"))
+         ((string-prefix-p s "unicode")
+          (setq isqlm-table-style 'unicode)
+          (isqlm--output-info "Line style: unicode\n"))
+         ((string-prefix-p s "none")
+          (setq isqlm-table-style 'none)
+          (isqlm--output-info "Line style: none\n"))
+         (t
+          (isqlm--output-error
+           "Usage: \\linestyle [ascii|unicode|none]\n")))))))
+
+(defun isqlm/timing (&rest args)
+  "Toggle or set timing display for SQL statements.
+With argument `on' or `off', set explicitly.
+Without argument, toggle."
   (let ((arg (car args)))
     (cond
      ((null arg)
-      (setq isqlm-table-style
-            (if (eq isqlm-table-style 'unicode) 'ascii 'unicode))
+      (setq isqlm-timing (not isqlm-timing))
       (isqlm--output-info
-       (format "Table style: %s\n" isqlm-table-style)))
-     ((string= (downcase arg) "ascii")
-      (setq isqlm-table-style 'ascii)
-      (isqlm--output-info "Table style: ascii\n"))
-     ((string= (downcase arg) "unicode")
-      (setq isqlm-table-style 'unicode)
-      (isqlm--output-info "Table style: unicode\n"))
+       (format "Timing is %s.\n" (if isqlm-timing "on" "off"))))
+     ((member (downcase arg) '("on" "1" "yes" "true"))
+      (setq isqlm-timing t)
+      (isqlm--output-info "Timing is on.\n"))
+     ((member (downcase arg) '("off" "0" "no" "false"))
+      (setq isqlm-timing nil)
+      (isqlm--output-info "Timing is off.\n"))
      (t
-      (isqlm--output-error "Usage: \\style [ascii|unicode]\n")))))
+      (isqlm--output-error "Usage: \\timing [on|off]\n")))))
 
 (defun isqlm/eval (&rest args)
   "Evaluate an Elisp expression.  ARGS are joined and read as a sexp.
@@ -2588,7 +2673,7 @@ When called interactively, prompt with completion for the connection name."
       (unless names
         (user-error "sql-connection-alist is empty or not defined"))
       (completing-read "Connection: " names nil t))))
-  (isqlm (format "*isqlm:%s*" connection))
+  (isqlm (format "*isqlm: <%s>*" connection))
   (unless (isqlm--connected-p)
     (isqlm/connect connection)
     (isqlm--emit-prompt)))
