@@ -184,6 +184,9 @@ This expansion happens after statement splitting and before `isqlm--execute-sql`
 | `\status` | `isqlm/status` | Show connection status |
 | `\linestyle` | `isqlm/linestyle` | Set/cycle line-drawing style (ascii/unicode/none) |
 | `\timing` | `isqlm/timing` | Toggle/set query execution timing display |
+| `\d` | `isqlm/d` | List tables/views or describe a table |
+| `\d+` | `isqlm/d+` | Same with extra detail (engine, size, CREATE TABLE) |
+| `\dt` / `\dv` / `\di` | `isqlm/dt` etc. | List tables / views / indexes |
 | `\eval` | `isqlm/eval` | Evaluate arbitrary Elisp expression |
 | `\echo` | `isqlm/echo` | Output text with variable expansion |
 | `\for` | `isqlm--for-start` | Loop over values with `{ body }` |

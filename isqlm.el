@@ -198,6 +198,10 @@ Plist with keys:
 (defvar-local isqlm--async-busy nil
   "Non-nil when an async query is running.  Used to block new input.")
 
+(defvar-local isqlm--suppress-summary nil
+  "When non-nil, suppress row-count summary in result output.
+Set temporarily by \\d-family commands.")
+
 (defvar-local isqlm-timing nil
   "When non-nil, display execution time after each SQL statement.")
 
@@ -812,16 +816,33 @@ Handles quoted strings and comments to avoid splitting inside them."
 
 (defun isqlm--display-width (str)
   "Return the display width of single-line STR.
-For multi-line strings, return the width of the longest line."
+For multi-line strings, return the width of the longest line.
+Correctly handles CJK double-width characters."
   (if (string-match-p "\n" str)
-      (apply #'max (mapcar #'length (split-string str "\n")))
-    (length str)))
+      (apply #'max (mapcar #'string-width (split-string str "\n")))
+    (string-width str)))
 
 (defun isqlm--truncate-string (str max-width)
-  "Truncate single-line STR to MAX-WIDTH with `...' if needed."
-  (if (> (length str) max-width)
-      (concat (substring str 0 (max 0 (- max-width 3))) "...")
-    str))
+  "Truncate single-line STR to MAX-WIDTH display columns with `...' if needed."
+  (if (<= (string-width str) max-width)
+      str
+    (let ((result "")
+          (i 0)
+          (target (- max-width 3)))
+      (while (and (< i (length str))
+                  (<= (string-width (concat result (substring str i (1+ i))))
+                      target))
+        (setq result (concat result (substring str i (1+ i))))
+        (setq i (1+ i)))
+      (concat result "..."))))
+
+(defun isqlm--pad-string (str width)
+  "Pad STR with spaces to reach WIDTH display columns.
+If STR is already wider than WIDTH, return STR unchanged."
+  (let ((sw (string-width str)))
+    (if (>= sw width)
+        str
+      (concat str (make-string (- width sw) ?\s)))))
 
 (defun isqlm--value-to-string (val)
   "Convert VAL to display string."
@@ -886,7 +907,7 @@ each data row into multiple display lines."
     ;; Compute column widths from headers
     (dotimes (i ncols)
       (setf (nth i widths)
-            (max (nth i widths) (length (nth i columns)))))
+            (max (nth i widths) (string-width (nth i columns)))))
     ;; Compute column widths from data (using display-width for multi-line)
     (dolist (row str-rows)
       (dotimes (i (min ncols (length row)))
@@ -916,8 +937,8 @@ each data row into multiple display lines."
                            (mapconcat
                             (lambda (pair)
                               (let ((name (car pair)) (w (cdr pair)))
-                                (isqlm--truncate-string
-                                 (format (format "%%-%ds" w) name) w)))
+                                (isqlm--pad-string
+                                 (isqlm--truncate-string name w) w)))
                             (cl-mapcar #'cons columns widths)
                             (concat " " v " "))
                            " " v "\n"))
@@ -952,7 +973,7 @@ Cells containing newlines are split across multiple display lines."
                          (w (cdr pair))
                          (line (or (nth line-idx lines) ""))
                          (truncated (isqlm--truncate-string line w)))
-                    (format (format "%%-%ds" w) truncated)))
+                    (isqlm--pad-string truncated w)))
                 (cl-mapcar #'cons cell-lines widths)
                 (concat " " vertical " "))
                " " vertical "\n"))
@@ -1055,6 +1076,7 @@ result is output.  When all statements finish, emit a prompt."
       (when (buffer-live-p buffer)
         (with-current-buffer buffer
           (setq isqlm--async-busy nil)
+          (setq isqlm--suppress-summary nil)
           (isqlm--emit-prompt)))
     ;; Execute the next statement
     (let* ((stmt (car statements))
@@ -1161,7 +1183,8 @@ CALLBACK is called (with no args) when this statement completes."
                ;; Not a connection-lost error
                (when isqlm-noisy (ding))
                (isqlm--output-mysql-error err)
-               (funcall callback))))))))))
+               (funcall callback)))))))))
+)
 
 (defun isqlm--async-handle-result (result sql query mode upper
                                           start-time)
@@ -1269,11 +1292,12 @@ Returns the formatted string, or \"\" for \\gset."
                                  (isqlm--format-vertical columns row) "\n"))
                        rows ""))
                   (isqlm--format-table columns rows))
-                (propertize
-                 (if truncated
-                     (format "%d rows in set%s (truncated from %d)\n" (length rows) ws nrows)
-                   (format "%d %s in set%s\n" nrows (if (= nrows 1) "row" "rows") ws))
-                 'font-lock-face 'isqlm-info-face)))))))
+                (unless isqlm--suppress-summary
+                  (propertize
+                   (if truncated
+                       (format "%d rows in set%s (truncated from %d)\n" (length rows) ws nrows)
+                     (format "%d %s in set%s\n" nrows (if (= nrows 1) "row" "rows") ws))
+                   'font-lock-face 'isqlm-info-face))))))))
       ('dml
        (let ((affected (plist-get result :affected-rows)))
          (propertize
@@ -1331,6 +1355,14 @@ _SQL is the original statement (unused), MODE is the terminator mode."
     "  \\history               show input history\n"
     "  \\linestyle [a|u|n]     set border style (ascii/unicode/none)\n"
     "  \\timing [on|off]       toggle query execution timing\n"
+    "\n"
+    "Informational (psql-style)\n"
+    "  \\d [TABLE]             list tables/views, or describe TABLE\n"
+    "  \\d+ [TABLE]            same with extra detail (engine, size, CREATE TABLE)\n"
+    "  \\dt [PATTERN]          list tables only\n"
+    "  \\dv [PATTERN]          list views only\n"
+    "  \\di [TABLE]            list indexes (all or for TABLE)\n"
+    "  PATTERN: * matches any, ? matches one character\n"
     "\n"
     "Control Flow\n"
     "  \\if EXPR               begin conditional block\n"
@@ -1797,6 +1829,165 @@ Press C-c C-c to execute, C-c C-k to abort."
                       (ring-ref isqlm-history-ring (- len 1 i)))
               lines))
       (isqlm--output (apply #'concat (nreverse lines))))))
+
+;; ============================================================
+;; \d family — describe database objects (psql-inspired)
+;; ============================================================
+
+(defun isqlm--d-list-tables (pattern type-filter verbose)
+  "List tables/views matching PATTERN.
+TYPE-FILTER is nil (all), \"BASE TABLE\", or \"VIEW\".
+VERBOSE non-nil adds engine, rows, size, comment (via TABLE STATUS)."
+  (if (not (isqlm--connected-p))
+      (isqlm--output-error "Not connected.\n")
+    (if verbose
+      ;; \dt+, \dv+, \d+ (list mode) — use information_schema.tables
+      (let* ((where-parts
+              (append
+               (when type-filter
+                 (list (format "TABLE_TYPE = '%s'" type-filter)))
+               (when pattern
+                 (list (format "TABLE_NAME LIKE '%s'"
+                               (replace-regexp-in-string
+                                "\\*" "%" (replace-regexp-in-string
+                                           "?" "_" pattern)))))))
+             (where (if where-parts
+                        (concat " WHERE TABLE_SCHEMA = DATABASE() AND "
+                                (mapconcat #'identity where-parts " AND "))
+                      " WHERE TABLE_SCHEMA = DATABASE()"))
+             (sql (concat
+                   "SELECT TABLE_NAME AS `Name`,"
+                   " REPLACE(TABLE_TYPE, 'BASE ', '') AS `Type`,"
+                   " IFNULL(ENGINE, '') AS `Engine`,"
+                   " IFNULL(TABLE_ROWS, '') AS `Rows`,"
+                   " IFNULL(CONCAT(ROUND((DATA_LENGTH + INDEX_LENGTH)"
+                   " / 1024 / 1024, 2), ' MB'), '') AS `Size`,"
+                   " IFNULL(TABLE_COMMENT, '') AS `Comment`"
+                   " FROM INFORMATION_SCHEMA.TABLES"
+                   where
+                   " ORDER BY TABLE_NAME")))
+        (isqlm--quick-sql (concat sql ";") t))
+    ;; Non-verbose: SHOW FULL TABLES
+    (let* ((like (when pattern
+                   (format " LIKE '%s'"
+                           (replace-regexp-in-string
+                            "\\*" "%" (replace-regexp-in-string
+                                       "?" "_" pattern)))))
+           (sql (concat "SHOW FULL TABLES" like ";")))
+      (if type-filter
+          ;; Filtered: need WHERE clause — use subquery approach
+          (let ((sql2 (concat
+                       "SELECT TABLE_NAME AS `Name`,"
+                       " REPLACE(TABLE_TYPE, 'BASE ', '') AS `Type`"
+                       " FROM INFORMATION_SCHEMA.TABLES"
+                       " WHERE TABLE_SCHEMA = DATABASE()"
+                       (format " AND TABLE_TYPE = '%s'" type-filter)
+                       (when pattern
+                         (format " AND TABLE_NAME LIKE '%s'"
+                                 (replace-regexp-in-string
+                                  "\\*" "%" (replace-regexp-in-string
+                                             "?" "_" pattern))))
+                       " ORDER BY TABLE_NAME;")))
+            (isqlm--quick-sql sql2 t))
+        (isqlm--quick-sql sql t))))))
+
+(defun isqlm--d-describe-table (table verbose)
+  "Describe TABLE: columns, indexes, constraints.
+VERBOSE non-nil adds table status (engine, size, collation, comment)
+and CREATE TABLE statement."
+  (if (not (isqlm--connected-p))
+      (isqlm--output-error "Not connected.\n")
+    (let ((q-table (replace-regexp-in-string "`" "``" table)))
+    ;; Columns
+    (isqlm--output-info (format "-- Table: %s\n" table))
+    (isqlm--quick-sql (format "SHOW FULL COLUMNS FROM `%s`;" q-table) t)
+    ;; Indexes
+    (isqlm--quick-sql (format "SHOW INDEX FROM `%s`;" q-table) t)
+    ;; Verbose: table status + create table
+    (when verbose
+      (isqlm--quick-sql
+       (format "SHOW TABLE STATUS LIKE '%s'\\G"
+               (replace-regexp-in-string "'" "''" table)) t)
+      (isqlm--quick-sql
+       (format "SHOW CREATE TABLE `%s`\\G" q-table) t)))))
+
+(defun isqlm--d-parse-modifiers (raw-cmd)
+  "Parse RAW-CMD (e.g. \"d\", \"dt\", \"d+\", \"dtS+\") into modifiers.
+Returns a plist (:types TYPE-LIST :verbose BOOL :system BOOL)."
+  (let ((suffix (substring raw-cmd 1))  ; strip leading "d"
+        (types nil)
+        (verbose nil)
+        (system nil))
+    (dolist (ch (string-to-list suffix))
+      (pcase ch
+        (?t (push 'table types))
+        (?v (push 'view types))
+        (?i (push 'index types))
+        (?+ (setq verbose t))
+        (?S (setq system t))))
+    (list :types (nreverse types) :verbose verbose :system system)))
+
+(defun isqlm--d-dispatch (raw-cmd args)
+  "Dispatch a \\d-family command.
+RAW-CMD is the command name without \\, ARGS is the argument list."
+  (setq isqlm--suppress-summary t)
+  (let* ((mods (isqlm--d-parse-modifiers raw-cmd))
+         (types (plist-get mods :types))
+         (verbose (plist-get mods :verbose))
+         (_system (plist-get mods :system))
+         (pattern (car args)))
+    (cond
+     ;; \d TABLE — describe a specific table (no type modifier, has pattern)
+     ((and (null types) pattern)
+      (isqlm--d-describe-table pattern verbose))
+     ;; \d — list all tables and views
+     ((null types)
+      (isqlm--d-list-tables pattern nil verbose))
+     ;; \dt — list tables only
+     ((memq 'table types)
+      (isqlm--d-list-tables pattern "BASE TABLE" verbose))
+     ;; \dv — list views only
+     ((memq 'view types)
+      (isqlm--d-list-tables pattern "VIEW" verbose))
+     ;; \di — list indexes
+     ((memq 'index types)
+      (if pattern
+          (isqlm--quick-sql (format "SHOW INDEX FROM `%s`;" pattern) t)
+        (isqlm--quick-sql
+         (concat "SELECT TABLE_NAME, INDEX_NAME, COLUMN_NAME,"
+                 " NON_UNIQUE, SEQ_IN_INDEX, INDEX_TYPE"
+                 " FROM INFORMATION_SCHEMA.STATISTICS"
+                 " WHERE TABLE_SCHEMA = DATABASE()"
+                 " ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX;") t))))))
+
+;; Define the isqlm/ entry points for the command dispatcher
+(defun isqlm/d (&rest args)
+  "Describe tables/views (psql-style).  See \\help for details."
+  (isqlm--d-dispatch "d" args))
+
+(defun isqlm/dt (&rest args)
+  "List tables.  \\dt PATTERN to filter."
+  (isqlm--d-dispatch "dt" args))
+
+(defun isqlm/dv (&rest args)
+  "List views.  \\dv PATTERN to filter."
+  (isqlm--d-dispatch "dv" args))
+
+(defun isqlm/di (&rest args)
+  "List/show indexes.  \\di TABLE to show indexes for a table."
+  (isqlm--d-dispatch "di" args))
+
+(defun isqlm/d+ (&rest args)
+  "Describe with extra detail (engine, size, CREATE TABLE)."
+  (isqlm--d-dispatch "d+" args))
+
+(defun isqlm/dt+ (&rest args)
+  "List tables with extra detail (engine, rows, size, comment)."
+  (isqlm--d-dispatch "dt+" args))
+
+(defun isqlm/dv+ (&rest args)
+  "List views with extra detail."
+  (isqlm--d-dispatch "dv+" args))
 
 (defun isqlm/quit (&rest _args)
   "Quit ISQLM."
@@ -2365,7 +2556,10 @@ Otherwise, insert a continuation prompt for multi-line input."
           (with-current-buffer isqlm-buf
             (isqlm--add-to-history accumulated)
             (setq isqlm-pending-input "")
-            (isqlm--emit-prompt))))
+            ;; Don't emit prompt if the command started an async operation
+            ;; (async-execute-statements will emit it when done)
+            (unless isqlm--async-busy
+              (isqlm--emit-prompt)))))
 
        ;; Incomplete SQL (no terminator yet)
        ((not (isqlm--sql-complete-p accumulated))
@@ -2466,11 +2660,13 @@ If an async query is in progress, cancel it."
   (interactive "sTable name: ")
   (isqlm--quick-sql (format "DESCRIBE `%s`;" table)))
 
-(defun isqlm--quick-sql (sql)
-  "Execute SQL directly via the async path, showing the command and result."
+(defun isqlm--quick-sql (sql &optional silent)
+  "Execute SQL directly via the async path.
+Unless SILENT is non-nil, display the SQL command before the result."
   (unless (isqlm--connected-p)
     (user-error "Not connected to MySQL"))
-  (isqlm--output (concat sql "\n"))
+  (unless silent
+    (isqlm--output (concat sql "\n")))
   (setq isqlm--async-busy t)
   (isqlm--async-execute-statements
    (isqlm--split-statements sql) (current-buffer)))

@@ -30,6 +30,7 @@ through the [`mysql-el`](https://github.com/swida/mysql-el) dynamic module (C FF
 - **MySQL-client error format** — errors display as `ERROR 1690 (22003): BIGINT value is out of range...` (same as the `mysql` CLI), with structured error data from `mysql-el`'s `mysql-error` signal
 - **Warning count display** — query results show warnings like `1 row in set, 2 warnings`
 - **Execution timing** — `\timing` toggles display of query execution time (milliseconds, with human-readable breakdown for long queries)
+- **psql-style `\d` commands** — `\d`, `\dt`, `\dv`, `\di`, `\d+` for listing and describing tables, views, and indexes
 
 ## Requirements
 
@@ -206,6 +207,11 @@ All built-in commands are prefixed with `\`:
 | `\status` | Show connection status |
 | `\linestyle [ascii\|unicode\|none]` | Set or cycle table border style (abbreviations: `a`, `u`, `n`) |
 | `\timing [on\|off]` | Toggle display of query execution time |
+| `\d [TABLE]` | List tables/views, or describe TABLE (columns + indexes) |
+| `\d+ [TABLE]` | Same with extra detail (engine, size, CREATE TABLE) |
+| `\dt [PATTERN]` | List tables (`\dt+` for detail) |
+| `\dv [PATTERN]` | List views (`\dv+` for detail) |
+| `\di [TABLE]` | List indexes (all or for TABLE) |
 | `\eval EXPRESSION` | Evaluate an Elisp expression |
 | `\clear` | Clear buffer |
 | `\history` | Show input history |
