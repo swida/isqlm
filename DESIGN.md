@@ -185,7 +185,7 @@ This expansion happens after statement splitting and before `isqlm--execute-sql`
 | `\linestyle` | `isqlm/linestyle` | Set/cycle line-drawing style (ascii/unicode/none) |
 | `\timing` | `isqlm/timing` | Toggle/set query execution timing display |
 | `\d` | `isqlm/d` | List tables/views or describe a table |
-| `\d+` | `isqlm/d+` | Same with extra detail (engine, size, CREATE TABLE) |
+| `\d+` | `isqlm/d+` | Same with extra detail (engine, size, CREATE TABLE, partition info) |
 | `\dt` / `\dv` / `\di` | `isqlm/dt` etc. | List tables / views / indexes |
 | `\eval` | `isqlm/eval` | Evaluate arbitrary Elisp expression |
 | `\echo` | `isqlm/echo` | Output text with variable expansion |
@@ -466,6 +466,10 @@ Character sets are defined in `isqlm--table-chars-ascii`, `isqlm--table-chars-un
 ### Multi-line Cell Values
 
 When a cell value contains `\n`, the table renderer splits it into multiple display lines. Column width is computed from the longest sub-line. Shorter sub-lines are padded with spaces. This correctly handles outputs like `EXPLAIN FORMAT=TREE`.
+
+### Visual Line Wrapping
+
+The ISQLM buffer sets `truncate-lines` to `nil`, so Emacs visually wraps long lines at the window edge. Table content is logically a single line (no inserted newlines), but the display folds at the window boundary. This avoids horizontal scrolling for wide results (e.g. `SELECT @@optimizer_switch`).
 
 ## 7. Prompt System
 

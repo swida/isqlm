@@ -1857,7 +1857,12 @@ VERBOSE non-nil adds engine, rows, size, comment (via TABLE STATUS)."
                       " WHERE TABLE_SCHEMA = DATABASE()"))
              (sql (concat
                    "SELECT TABLE_NAME AS `Name`,"
-                   " REPLACE(TABLE_TYPE, 'BASE ', '') AS `Type`,"
+                   " CASE"
+                   "   WHEN TABLE_TYPE = 'VIEW' THEN 'VIEW'"
+                   "   WHEN CREATE_OPTIONS LIKE '%partitioned%'"
+                   "     THEN 'PARTITION TABLE'"
+                   "   ELSE 'TABLE'"
+                   " END AS `Type`,"
                    " IFNULL(ENGINE, '') AS `Engine`,"
                    " IFNULL(TABLE_ROWS, '') AS `Rows`,"
                    " IFNULL(CONCAT(ROUND((DATA_LENGTH + INDEX_LENGTH)"
@@ -1867,49 +1872,133 @@ VERBOSE non-nil adds engine, rows, size, comment (via TABLE STATUS)."
                    where
                    " ORDER BY TABLE_NAME")))
         (isqlm--quick-sql (concat sql ";") t))
-    ;; Non-verbose: SHOW FULL TABLES
-    (let* ((like (when pattern
-                   (format " LIKE '%s'"
-                           (replace-regexp-in-string
-                            "\\*" "%" (replace-regexp-in-string
-                                       "?" "_" pattern)))))
-           (sql (concat "SHOW FULL TABLES" like ";")))
-      (if type-filter
-          ;; Filtered: need WHERE clause — use subquery approach
-          (let ((sql2 (concat
-                       "SELECT TABLE_NAME AS `Name`,"
-                       " REPLACE(TABLE_TYPE, 'BASE ', '') AS `Type`"
-                       " FROM INFORMATION_SCHEMA.TABLES"
-                       " WHERE TABLE_SCHEMA = DATABASE()"
-                       (format " AND TABLE_TYPE = '%s'" type-filter)
-                       (when pattern
-                         (format " AND TABLE_NAME LIKE '%s'"
-                                 (replace-regexp-in-string
-                                  "\\*" "%" (replace-regexp-in-string
-                                             "?" "_" pattern))))
-                       " ORDER BY TABLE_NAME;")))
-            (isqlm--quick-sql sql2 t))
-        (isqlm--quick-sql sql t))))))
+    ;; Non-verbose: list Name + Type (detecting partitioned tables)
+    (let* ((where-parts
+            (append
+             (when type-filter
+               (list (format "TABLE_TYPE = '%s'" type-filter)))
+             (when pattern
+               (list (format "TABLE_NAME LIKE '%s'"
+                             (replace-regexp-in-string
+                              "\\*" "%" (replace-regexp-in-string
+                                         "?" "_" pattern)))))))
+           (where (if where-parts
+                      (concat " AND "
+                              (mapconcat #'identity where-parts " AND "))
+                    ""))
+           (sql (concat
+                 "SELECT TABLE_NAME AS `Name`,"
+                 " CASE"
+                 "   WHEN TABLE_TYPE = 'VIEW' THEN 'VIEW'"
+                 "   WHEN CREATE_OPTIONS LIKE '%partitioned%'"
+                 "     THEN 'PARTITION TABLE'"
+                 "   ELSE 'TABLE'"
+                 " END AS `Type`"
+                 " FROM INFORMATION_SCHEMA.TABLES"
+                 " WHERE TABLE_SCHEMA = DATABASE()" where
+                 " ORDER BY TABLE_NAME;")))
+      (isqlm--quick-sql sql t)))))
+
+(defun isqlm--d-format-partition-info (result)
+  "Format partition information from RESULT into a psql-style string.
+RESULT is a plist from querying INFORMATION_SCHEMA.PARTITIONS.
+Returns a formatted string or nil if no partitions."
+  (when (and result
+             (eq (plist-get result :type) 'select)
+             (plist-get result :rows))
+    (let* ((rows (plist-get result :rows))
+           ;; columns: PARTITION_METHOD, PARTITION_EXPRESSION,
+           ;;          SUBPARTITION_METHOD, SUBPARTITION_EXPRESSION,
+           ;;          PARTITION_NAME, PARTITION_DESCRIPTION,
+           ;;          PARTITION_ORDINAL_POSITION
+           (first-row (car rows))
+           (method (nth 0 first-row))
+           (expr (nth 1 first-row))
+           (sub-method (nth 2 first-row))
+           (sub-expr (nth 3 first-row)))
+      (when method
+        (let ((lines (list (format "Partition key: %s (%s)" method expr)))
+              (parts nil))
+          ;; Collect partition entries
+          (dolist (row rows)
+            (let ((pname (nth 4 row))
+                  (pdesc (nth 5 row)))
+              (when pname
+                (push
+                 (if pdesc
+                     (format "%s VALUES %s"
+                             pname
+                             (cond
+                              ((string-match-p "\\`RANGE" method)
+                               (if (string= pdesc "MAXVALUE")
+                                   "LESS THAN MAXVALUE"
+                                 (format "LESS THAN (%s)" pdesc)))
+                              ((string-match-p "\\`LIST" method)
+                               (format "IN (%s)" pdesc))
+                              (t pdesc)))
+                   pname)
+                 parts))))
+          (setq parts (nreverse parts))
+          (when sub-method
+            (push (format "Subpartition key: %s (%s)" sub-method sub-expr)
+                  lines))
+          (when parts
+            (let ((indent (make-string (length "Partitions: ") ?\s)))
+              (push (concat "Partitions: "
+                            (car parts)
+                            (mapconcat (lambda (p) (concat ",\n" indent p))
+                                       (cdr parts) ""))
+                    lines)))
+          (mapconcat #'identity (nreverse lines) "\n"))))))
 
 (defun isqlm--d-describe-table (table verbose)
   "Describe TABLE: columns, indexes, constraints.
-VERBOSE non-nil adds table status (engine, size, collation, comment)
-and CREATE TABLE statement."
+VERBOSE non-nil adds table status (engine, size, collation, comment),
+CREATE TABLE statement, and partition information."
   (if (not (isqlm--connected-p))
       (isqlm--output-error "Not connected.\n")
-    (let ((q-table (replace-regexp-in-string "`" "``" table)))
-    ;; Columns
-    (isqlm--output-info (format "-- Table: %s\n" table))
-    (isqlm--quick-sql (format "SHOW FULL COLUMNS FROM `%s`;" q-table) t)
-    ;; Indexes
-    (isqlm--quick-sql (format "SHOW INDEX FROM `%s`;" q-table) t)
-    ;; Verbose: table status + create table
-    (when verbose
-      (isqlm--quick-sql
-       (format "SHOW TABLE STATUS LIKE '%s'\\G"
-               (replace-regexp-in-string "'" "''" table)) t)
-      (isqlm--quick-sql
-       (format "SHOW CREATE TABLE `%s`\\G" q-table) t)))))
+    (let* ((q-table (replace-regexp-in-string "`" "``" table))
+           (q-name (replace-regexp-in-string "'" "''" table))
+           (stmts (list (format "SHOW FULL COLUMNS FROM `%s`;" q-table)
+                        (format "SHOW INDEX FROM `%s`;" q-table)))
+           (buf (current-buffer)))
+      (when verbose
+        (setq stmts
+              (append stmts
+                      (list (format "SHOW TABLE STATUS LIKE '%s'\\G" q-name)
+                            (format "SHOW CREATE TABLE `%s`\\G" q-table)))))
+      ;; Header
+      (isqlm--output-info (format "-- Table: %s\n" table))
+      ;; Execute all statements chained, then append partition info
+      (setq isqlm--async-busy t)
+      (isqlm--async-run-statements
+       stmts buf
+       (lambda ()
+         (when (and verbose (buffer-live-p buf))
+           (with-current-buffer buf
+             (let* ((part-result
+                     (ignore-errors
+                       (isqlm-execute-string
+                        (format
+                         (concat
+                          "SELECT PARTITION_METHOD, PARTITION_EXPRESSION,"
+                          " SUBPARTITION_METHOD, SUBPARTITION_EXPRESSION,"
+                          " PARTITION_NAME, PARTITION_DESCRIPTION,"
+                          " PARTITION_ORDINAL_POSITION"
+                          " FROM INFORMATION_SCHEMA.PARTITIONS"
+                          " WHERE TABLE_SCHEMA = DATABASE()"
+                          " AND TABLE_NAME = '%s'"
+                          " AND PARTITION_NAME IS NOT NULL"
+                          " ORDER BY PARTITION_ORDINAL_POSITION")
+                         q-name))))
+                    (info (isqlm--d-format-partition-info part-result)))
+               (when info
+                 (isqlm--output-info (concat "\n" info "\n"))))))
+         (when (buffer-live-p buf)
+           (with-current-buffer buf
+             (setq isqlm--async-busy nil)
+             (setq isqlm--suppress-summary nil)
+             (isqlm--emit-prompt))))))))
 
 (defun isqlm--d-parse-modifiers (raw-cmd)
   "Parse RAW-CMD (e.g. \"d\", \"dt\", \"d+\", \"dtS+\") into modifiers.
@@ -2792,7 +2881,7 @@ Type `\\help' at the prompt for built-in commands.
   (setq isqlm-prompt-internal (or isqlm-prompt "SQL> "))
   (setq isqlm-pending-input "")
   (setq mode-line-process '(" [disconnected]"))
-  (setq truncate-lines t)
+  (setq truncate-lines nil)
   ;; Markers
   (setq isqlm-last-input-start  (point-min-marker))
   (setq isqlm-last-input-end    (point-min-marker))

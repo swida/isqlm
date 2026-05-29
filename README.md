@@ -23,14 +23,14 @@ through the [`mysql-el`](https://github.com/swida/mysql-el) dynamic module (C FF
 - **Send SQL from external buffers** — `isqlm-send-region`, `isqlm-send-paragraph`, etc.
 - **Ring-based input history** with file persistence (`M-p` / `M-n`)
 - **SQL keyword font-locking**
-- **Auto-adaptive column widths** based on window size
+- **Auto-adaptive column widths** with visual line wrapping in the window
 - **Command aliases** — extensible shorthand mappings (`\?` = `\help`, etc.)
 - **Elisp function dispatch** — `\CMD` falls back to Emacs Lisp functions (à la Eshell)
 - **Variable references** — use `:varname` in command args to reference Emacs variables
 - **MySQL-client error format** — errors display as `ERROR 1690 (22003): BIGINT value is out of range...` (same as the `mysql` CLI), with structured error data from `mysql-el`'s `mysql-error` signal
 - **Warning count display** — query results show warnings like `1 row in set, 2 warnings`
 - **Execution timing** — `\timing` toggles display of query execution time (milliseconds, with human-readable breakdown for long queries)
-- **psql-style `\d` commands** — `\d`, `\dt`, `\dv`, `\di`, `\d+` for listing and describing tables, views, and indexes
+- **psql-style `\d` commands** — `\d`, `\dt`, `\dv`, `\di`, `\d+` for listing and describing tables, views, and indexes; `\d+ TABLE` shows partition info for partitioned tables
 
 ## Requirements
 
@@ -208,7 +208,7 @@ All built-in commands are prefixed with `\`:
 | `\linestyle [ascii\|unicode\|none]` | Set or cycle table border style (abbreviations: `a`, `u`, `n`) |
 | `\timing [on\|off]` | Toggle display of query execution time |
 | `\d [TABLE]` | List tables/views, or describe TABLE (columns + indexes) |
-| `\d+ [TABLE]` | Same with extra detail (engine, size, CREATE TABLE) |
+| `\d+ [TABLE]` | Same with extra detail (engine, size, CREATE TABLE, partition info) |
 | `\dt [PATTERN]` | List tables (`\dt+` for detail) |
 | `\dv [PATTERN]` | List views (`\dv+` for detail) |
 | `\di [TABLE]` | List indexes (all or for TABLE) |
