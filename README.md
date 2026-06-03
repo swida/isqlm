@@ -31,6 +31,7 @@ through the [`mysql-el`](https://github.com/swida/mysql-el) dynamic module (C FF
 - **Warning count display** — query results show warnings like `1 row in set, 2 warnings`
 - **Execution timing** — `\timing` toggles display of query execution time (milliseconds, with human-readable breakdown for long queries)
 - **psql-style `\d` commands** — `\d`, `\dt`, `\dv`, `\di`, `\d+` for listing and describing tables, views, and indexes; `\d+ TABLE` shows partition info for partitioned tables
+- **psql-style `\df` commands** — `\df`, `\dfn`, `\dfp`, `\df+` for listing functions and procedures with optional argument-type filtering
 
 ## Requirements
 
@@ -212,6 +213,7 @@ All built-in commands are prefixed with `\`:
 | `\dt [PATTERN]` | List tables (`\dt+` for detail) |
 | `\dv [PATTERN]` | List views (`\dv+` for detail) |
 | `\di [TABLE]` | List indexes (all or for TABLE) |
+| `\df[np][S][+] [PATTERN [ARG_PATTERN ...]]` | List functions/procedures (`n`=functions, `p`=procedures, `S`=system, `+`=detail) |
 | `\eval EXPRESSION` | Evaluate an Elisp expression |
 | `\clear` | Clear buffer |
 | `\history` | Show input history |

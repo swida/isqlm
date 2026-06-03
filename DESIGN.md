@@ -187,6 +187,7 @@ This expansion happens after statement splitting and before `isqlm--execute-sql`
 | `\d` | `isqlm/d` | List tables/views or describe a table |
 | `\d+` | `isqlm/d+` | Same with extra detail (engine, size, CREATE TABLE, partition info) |
 | `\dt` / `\dv` / `\di` | `isqlm/dt` etc. | List tables / views / indexes |
+| `\df[np][S][+]` | `isqlm/df` etc. | List functions / procedures |
 | `\eval` | `isqlm/eval` | Evaluate arbitrary Elisp expression |
 | `\echo` | `isqlm/echo` | Output text with variable expansion |
 | `\for` | `isqlm--for-start` | Loop over values with `{ body }` |
@@ -261,6 +262,63 @@ Inspired by PostgreSQL's `psql` meta-commands. Uses a stack-based approach:
 - On `}`, `isqlm--for-execute-body` iterates: for each value, binds the variable with `set`, then processes each body line (dispatching `\` commands or executing SQL with variable expansion)
 
 **Inline parsing**: the body string between `{` and `}` is split on `;`. Non-command lines without terminators get `;` auto-appended.
+
+## 4.3 Listing Functions/Procedures (`\df`)
+
+Inspired by PostgreSQL's `\df` meta-command. Lists stored functions and procedures from `INFORMATION_SCHEMA.ROUTINES`.
+
+**Syntax**: `\df[np][S][+] [PATTERN [ARG_PATTERN ...]]`
+
+**Modifier letters** (parsed by `isqlm--df-parse-modifiers`):
+
+| Letter | Meaning |
+|--------|---------|
+| `n` | Show only normal functions (`ROUTINE_TYPE = 'FUNCTION'`) |
+| `p` | Show only procedures (`ROUTINE_TYPE = 'PROCEDURE'`) |
+| `S` | Include system routines (all schemas, not just `DATABASE()`) |
+| `+` | Verbose mode — show additional columns |
+
+Without `n` or `p`, both functions and procedures are shown.
+
+**Output columns**:
+
+| Mode | Columns |
+|------|---------|
+| Normal | Name, Result, Arguments, Type |
+| Verbose (`+`) | Name, Result, Arguments, Type, Volatility, Owner, Security, Description |
+| With `S` | Prepends `Schema` column |
+
+**Type mapping** (MySQL → psql-style):
+
+| MySQL `ROUTINE_TYPE` | Displayed as |
+|----------------------|-------------|
+| `FUNCTION` | `normal` |
+| `PROCEDURE` | `procedure` |
+
+MySQL does not have aggregate, trigger, or window function types in `INFORMATION_SCHEMA.ROUTINES`, so only `normal` and `procedure` are shown.
+
+**Argument type filtering**: Additional arguments after PATTERN are matched against parameter types via `INFORMATION_SCHEMA.PARAMETERS`:
+
+- `\df * int` — routines whose 1st parameter type matches `int`
+- `\df * int varchar` — 1st param is `int`, 2nd is `varchar`
+- `\df * int -` — exactly one parameter, of type `int` (the `-` sentinel constrains the total parameter count)
+
+**Implementation**:
+
+| Function | Description |
+|----------|-------------|
+| `isqlm--df-parse-modifiers` | Parse modifier letters from the command name (e.g. `"dfnS+"` → `(:types (function) :verbose t :system t)`) |
+| `isqlm--df-dispatch` | Build and execute the `INFORMATION_SCHEMA.ROUTINES` query with appropriate WHERE clauses |
+| `isqlm/df`, `isqlm/dfn`, `isqlm/dfp`, etc. | Entry points for the command dispatcher — each calls `isqlm--df-dispatch` with the raw command name |
+
+**Verbose columns** (from `INFORMATION_SCHEMA.ROUTINES`):
+
+| Column | Source |
+|--------|--------|
+| Volatility | `SQL_DATA_ACCESS` (e.g. `CONTAINS SQL`, `NO SQL`, `READS SQL DATA`) |
+| Owner | `DEFINER` |
+| Security | `SECURITY_TYPE` (`DEFINER` or `INVOKER`) |
+| Description | `ROUTINE_COMMENT` |
 
 ## 5. SQL Execution Layer
 

@@ -1362,6 +1362,9 @@ _SQL is the original statement (unused), MODE is the terminator mode."
     "  \\dt [PATTERN]          list tables only\n"
     "  \\dv [PATTERN]          list views only\n"
     "  \\di [TABLE]            list indexes (all or for TABLE)\n"
+    "  \\df[np][S][+] [PATTERN [ARG_PATTERN ...]]\n"
+    "                         list functions/procedures\n"
+    "                         n=normal(function) p=procedure S=system +=detail\n"
     "  PATTERN: * matches any, ? matches one character\n"
     "\n"
     "Control Flow\n"
@@ -1952,54 +1955,151 @@ Returns a formatted string or nil if no partitions."
           (mapconcat #'identity (nreverse lines) "\n"))))))
 
 (defun isqlm--d-describe-table (table verbose)
-  "Describe TABLE: columns, indexes, constraints.
-VERBOSE non-nil adds table status (engine, size, collation, comment),
-CREATE TABLE statement, and partition information."
+  "Describe TABLE in psql style.
+When VERBOSE is nil, show: Column, Type, Null, Key, Default, Extra.
+When VERBOSE is non-nil, additionally show Collation and Comment columns,
+plus footer with Engine, Charset, and Indexes information."
   (if (not (isqlm--connected-p))
       (isqlm--output-error "Not connected.\n")
     (let* ((q-table (replace-regexp-in-string "`" "``" table))
-           (q-name (replace-regexp-in-string "'" "''" table))
-           (stmts (list (format "SHOW FULL COLUMNS FROM `%s`;" q-table)
-                        (format "SHOW INDEX FROM `%s`;" q-table)))
-           (buf (current-buffer)))
-      (when verbose
-        (setq stmts
-              (append stmts
-                      (list (format "SHOW TABLE STATUS LIKE '%s'\\G" q-name)
-                            (format "SHOW CREATE TABLE `%s`\\G" q-table)))))
-      ;; Header
-      (isqlm--output-info (format "-- Table: %s\n" table))
-      ;; Execute all statements chained, then append partition info
+           (q-name (replace-regexp-in-string "'" "''" table)))
       (setq isqlm--async-busy t)
-      (isqlm--async-run-statements
-       stmts buf
-       (lambda ()
-         (when (and verbose (buffer-live-p buf))
-           (with-current-buffer buf
-             (let* ((part-result
+      (condition-case err
+          (let* ((col-result (isqlm-execute-string
+                              (format "SHOW FULL COLUMNS FROM `%s`" q-table)))
+                 (all-cols (plist-get col-result :columns))
+                 (all-rows (plist-get col-result :rows))
+                 ;; Select columns based on verbose mode
+                 (want (if verbose
+                           '("Field" "Type" "Collation" "Null" "Key"
+                             "Default" "Extra" "Comment")
+                         '("Field" "Type" "Null" "Key" "Default" "Extra")))
+                 (indices (mapcar
+                           (lambda (name)
+                             (cl-position name all-cols :test #'string=))
+                           want))
+                 (columns (cl-remove nil
+                            (cl-mapcar (lambda (name idx)
+                                         (when idx name))
+                                       want indices)))
+                 (valid-indices (cl-remove nil indices))
+                 (rows (mapcar
+                         (lambda (row)
+                           (mapcar (lambda (idx) (nth idx row))
+                                   valid-indices))
+                         all-rows))
+                 (table-str (isqlm--format-table columns rows)))
+            ;; Header
+            (isqlm--output-info (format "-- Table: %s\n" table))
+            ;; Column table
+            (isqlm--output table-str)
+            ;; Footer info for verbose mode
+            (when verbose
+              ;; Indexes
+              (let ((idx-result
                      (ignore-errors
                        (isqlm-execute-string
-                        (format
-                         (concat
-                          "SELECT PARTITION_METHOD, PARTITION_EXPRESSION,"
-                          " SUBPARTITION_METHOD, SUBPARTITION_EXPRESSION,"
-                          " PARTITION_NAME, PARTITION_DESCRIPTION,"
-                          " PARTITION_ORDINAL_POSITION"
-                          " FROM INFORMATION_SCHEMA.PARTITIONS"
-                          " WHERE TABLE_SCHEMA = DATABASE()"
-                          " AND TABLE_NAME = '%s'"
-                          " AND PARTITION_NAME IS NOT NULL"
-                          " ORDER BY PARTITION_ORDINAL_POSITION")
-                         q-name))))
-                    (info (isqlm--d-format-partition-info part-result)))
-               (when info
-                 (isqlm--output-info (concat "\n" info "\n"))))))
-         (when (buffer-live-p buf)
-           (with-current-buffer buf
-             (setq isqlm--async-busy nil)
-             (setq isqlm--suppress-summary nil)
-             (isqlm--emit-prompt))))))))
-
+                        (format "SHOW INDEX FROM `%s`" q-table)))))
+                (when (and idx-result
+                           (plist-get idx-result :rows))
+                  (let* ((idx-cols (plist-get idx-result :columns))
+                         (idx-rows (plist-get idx-result :rows))
+                         (name-pos (cl-position "Key_name" idx-cols
+                                                :test #'string=))
+                         (col-pos (cl-position "Column_name" idx-cols
+                                               :test #'string=))
+                         (uniq-pos (cl-position "Non_unique" idx-cols
+                                                :test #'string=))
+                         (type-pos (cl-position "Index_type" idx-cols
+                                                :test #'string=))
+                         ;; Group columns by index name
+                         (index-map nil))
+                    (when (and name-pos col-pos)
+                      (dolist (row idx-rows)
+                        (let* ((iname (nth name-pos row))
+                               (icol (nth col-pos row))
+                               (existing (assoc iname index-map)))
+                          (if existing
+                              (setcdr existing
+                                      (append (cdr existing) (list icol)))
+                            (push (list iname icol) index-map))))
+                      (setq index-map (nreverse index-map))
+                      (isqlm--output-info "Indexes:\n")
+                      (dolist (entry index-map)
+                        (let* ((iname (car entry))
+                               (icols (cdr entry))
+                               (sample-row (cl-find iname idx-rows
+                                                    :key (lambda (r)
+                                                           (nth name-pos r))
+                                                    :test #'string=))
+                               (unique (and uniq-pos
+                                            (equal (nth uniq-pos sample-row)
+                                                   "0")))
+                               (itype (and type-pos
+                                           (nth type-pos sample-row)))
+                               (desc (format "    \"%s\" %s%s (%s)\n"
+                                             iname
+                                             (or itype "")
+                                             (if unique " UNIQUE" "")
+                                             (mapconcat #'identity icols
+                                                        ", "))))
+                          (isqlm--output-info desc)))))))
+              ;; Table status (Engine, Charset)
+              (let ((status-result
+                     (ignore-errors
+                       (isqlm-execute-string
+                        (format "SHOW TABLE STATUS LIKE '%s'" q-name)))))
+                (when (and status-result (plist-get status-result :rows))
+                  (let* ((st-cols (plist-get status-result :columns))
+                         (st-row (car (plist-get status-result :rows)))
+                         (engine-pos (cl-position "Engine" st-cols
+                                                  :test #'string=))
+                         (coll-pos (cl-position "Collation" st-cols
+                                                :test #'string=))
+                         (rows-pos (cl-position "Rows" st-cols
+                                                :test #'string=))
+                         (engine (and engine-pos (nth engine-pos st-row)))
+                         (collation (and coll-pos (nth coll-pos st-row)))
+                         (nrows (and rows-pos (nth rows-pos st-row))))
+                    (isqlm--output-info
+                     (format "Engine: %s" (or engine "?")))
+                    (when collation
+                      (isqlm--output-info
+                       (format ", Collation: %s" collation)))
+                    (when nrows
+                      (isqlm--output-info
+                       (format ", Rows: ~%s" nrows)))
+                    (isqlm--output-info "\n"))))
+              ;; Partition info
+              (let* ((part-result
+                      (ignore-errors
+                        (isqlm-execute-string
+                         (format
+                          (concat
+                           "SELECT PARTITION_METHOD, PARTITION_EXPRESSION,"
+                           " SUBPARTITION_METHOD, SUBPARTITION_EXPRESSION,"
+                           " PARTITION_NAME, PARTITION_DESCRIPTION,"
+                           " PARTITION_ORDINAL_POSITION"
+                           " FROM INFORMATION_SCHEMA.PARTITIONS"
+                           " WHERE TABLE_SCHEMA = DATABASE()"
+                           " AND TABLE_NAME = '%s'"
+                           " AND PARTITION_NAME IS NOT NULL"
+                           " ORDER BY PARTITION_ORDINAL_POSITION")
+                          q-name))))
+                     (info (isqlm--d-format-partition-info part-result)))
+                (when info
+                  (isqlm--output-info (concat info "\n")))))
+            ;; Summary
+            (isqlm--output-info
+             (format "%d columns\n" (length all-rows)))
+            (setq isqlm--async-busy nil)
+            (setq isqlm--suppress-summary nil)
+            (isqlm--emit-prompt))
+        (error
+         (setq isqlm--async-busy nil)
+         (setq isqlm--suppress-summary nil)
+         (isqlm--output-mysql-error err)
+         (isqlm--emit-prompt))))))
 (defun isqlm--d-parse-modifiers (raw-cmd)
   "Parse RAW-CMD (e.g. \"d\", \"dt\", \"d+\", \"dtS+\") into modifiers.
 Returns a plist (:types TYPE-LIST :verbose BOOL :system BOOL)."
@@ -2048,6 +2148,198 @@ RAW-CMD is the command name without \\, ARGS is the argument list."
                  " FROM INFORMATION_SCHEMA.STATISTICS"
                  " WHERE TABLE_SCHEMA = DATABASE()"
                  " ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX;") t))))))
+
+;; ============================================================
+;; \df — list functions/procedures (psql-style)
+;; ============================================================
+
+(defun isqlm--df-parse-modifiers (raw-cmd)
+  "Parse RAW-CMD (e.g. \"df\", \"dfn\", \"dfp\", \"dfnp+\") into modifiers.
+Returns a plist (:types TYPE-LIST :verbose BOOL :system BOOL).
+Type letters: n = normal (FUNCTION), p = PROCEDURE."
+  (let ((suffix (substring raw-cmd 2))  ; strip leading "df"
+        (types nil)
+        (verbose nil)
+        (system nil))
+    (dolist (ch (string-to-list suffix))
+      (pcase ch
+        (?n (push 'function types))
+        (?p (push 'procedure types))
+        (?+ (setq verbose t))
+        (?S (setq system t))))
+    (list :types (nreverse types) :verbose verbose :system system)))
+
+(defun isqlm--df-dispatch (raw-cmd args)
+  "Dispatch a \\df-family command.
+RAW-CMD is the command name without \\, ARGS is the argument list."
+  (if (not (isqlm--connected-p))
+      (isqlm--output-error "Not connected.\n")
+    (setq isqlm--suppress-summary t)
+    (let* ((mods (isqlm--df-parse-modifiers raw-cmd))
+           (types (plist-get mods :types))
+           (verbose (plist-get mods :verbose))
+           (system (plist-get mods :system))
+           (pattern (car args))
+           (arg-patterns (cdr args))
+           ;; Determine routine types to show
+           (type-filter
+            (cond
+             ((null types) '("FUNCTION" "PROCEDURE"))
+             (t (mapcar (lambda (tp)
+                          (pcase tp
+                            ('function "FUNCTION")
+                            ('procedure "PROCEDURE")))
+                        types))))
+           ;; Build WHERE clause
+           (where-parts
+            (append
+             ;; Schema filter
+             (if system
+                 nil  ; show all schemas
+               (list "ROUTINE_SCHEMA = DATABASE()"))
+             ;; Type filter
+             (when type-filter
+               (list (format "ROUTINE_TYPE IN (%s)"
+                             (mapconcat (lambda (rt) (format "'%s'" rt))
+                                        type-filter ", "))))
+             ;; Name pattern
+             (when pattern
+               (list (format "ROUTINE_NAME LIKE '%s'"
+                             (replace-regexp-in-string
+                              "\\*" "%" (replace-regexp-in-string
+                                         "?" "_" pattern)))))
+             ;; Argument type patterns (match against parameter types)
+             (let ((clauses nil)
+                   (pos 0))
+               (dolist (ap arg-patterns)
+                 (if (string= ap "-")
+                     ;; Dash means: no more parameters after this position
+                     (progn
+                       (push (format
+                              (concat "(SELECT COUNT(*) FROM"
+                                      " INFORMATION_SCHEMA.PARAMETERS p"
+                                      " WHERE p.SPECIFIC_SCHEMA = r.ROUTINE_SCHEMA"
+                                      " AND p.SPECIFIC_NAME = r.ROUTINE_NAME"
+                                      " AND p.ORDINAL_POSITION > 0) = %d")
+                              pos)
+                             clauses))
+                   (setq pos (1+ pos))
+                   (push (format
+                          (concat "(SELECT COUNT(*) FROM"
+                                  " INFORMATION_SCHEMA.PARAMETERS p"
+                                  " WHERE p.SPECIFIC_SCHEMA = r.ROUTINE_SCHEMA"
+                                  " AND p.SPECIFIC_NAME = r.ROUTINE_NAME"
+                                  " AND p.ORDINAL_POSITION = %d"
+                                  " AND p.DATA_TYPE LIKE '%s') > 0")
+                          pos
+                          (replace-regexp-in-string
+                           "\\*" "%" (replace-regexp-in-string
+                                      "?" "_" ap)))
+                         clauses)))
+               (nreverse clauses))))
+           (where (if where-parts
+                      (concat " WHERE "
+                              (mapconcat #'identity where-parts " AND "))
+                    ""))
+           ;; Build SELECT columns
+           (sql (if verbose
+                    (concat
+                     "SELECT"
+                     (if system " r.ROUTINE_SCHEMA AS `Schema`," "")
+                     " r.ROUTINE_NAME AS `Name`,"
+                     " r.DTD_IDENTIFIER AS `Result`,"
+                     " IFNULL((SELECT GROUP_CONCAT("
+                     "   CONCAT(p.PARAMETER_NAME, ' ', p.DTD_IDENTIFIER)"
+                     "   ORDER BY p.ORDINAL_POSITION SEPARATOR ', ')"
+                     "  FROM INFORMATION_SCHEMA.PARAMETERS p"
+                     "  WHERE p.SPECIFIC_SCHEMA = r.ROUTINE_SCHEMA"
+                     "  AND p.SPECIFIC_NAME = r.ROUTINE_NAME"
+                     "  AND p.ORDINAL_POSITION > 0), '') AS `Arguments`,"
+                     " CASE r.ROUTINE_TYPE"
+                     "   WHEN 'FUNCTION' THEN 'normal'"
+                     "   WHEN 'PROCEDURE' THEN 'procedure'"
+                     " END AS `Type`,"
+                     " r.SQL_DATA_ACCESS AS `Volatility`,"
+                     " r.DEFINER AS `Owner`,"
+                     " r.SECURITY_TYPE AS `Security`,"
+                     " r.ROUTINE_COMMENT AS `Description`"
+                     " FROM INFORMATION_SCHEMA.ROUTINES r"
+                     where
+                     " ORDER BY r.ROUTINE_NAME")
+                  (concat
+                   "SELECT"
+                   (if system " r.ROUTINE_SCHEMA AS `Schema`," "")
+                   " r.ROUTINE_NAME AS `Name`,"
+                   " r.DTD_IDENTIFIER AS `Result`,"
+                   " IFNULL((SELECT GROUP_CONCAT("
+                   "   CONCAT(p.PARAMETER_NAME, ' ', p.DTD_IDENTIFIER)"
+                   "   ORDER BY p.ORDINAL_POSITION SEPARATOR ', ')"
+                   "  FROM INFORMATION_SCHEMA.PARAMETERS p"
+                   "  WHERE p.SPECIFIC_SCHEMA = r.ROUTINE_SCHEMA"
+                   "  AND p.SPECIFIC_NAME = r.ROUTINE_NAME"
+                   "  AND p.ORDINAL_POSITION > 0), '') AS `Arguments`,"
+                   " CASE r.ROUTINE_TYPE"
+                   "   WHEN 'FUNCTION' THEN 'normal'"
+                   "   WHEN 'PROCEDURE' THEN 'procedure'"
+                   " END AS `Type`"
+                   " FROM INFORMATION_SCHEMA.ROUTINES r"
+                   where
+                   " ORDER BY r.ROUTINE_NAME"))))
+      (isqlm--quick-sql (concat sql ";") t))))
+
+;; Define the isqlm/ entry points for \df commands
+(defun isqlm/df (&rest args)
+  "List functions and procedures (psql-style).
+\\df[np][S][+] [PATTERN [ARG_PATTERN ...]]
+  n = normal (functions), p = procedures
+  S = include system routines, + = extra detail
+  PATTERN filters by name, ARG_PATTERNs filter by argument types.
+  Use - as last arg_pattern to match exact argument count."
+  (isqlm--df-dispatch "df" args))
+
+(defun isqlm/dfn (&rest args)
+  "List functions only.  \\dfn PATTERN to filter."
+  (isqlm--df-dispatch "dfn" args))
+
+(defun isqlm/dfp (&rest args)
+  "List procedures only.  \\dfp PATTERN to filter."
+  (isqlm--df-dispatch "dfp" args))
+
+(defun isqlm/df+ (&rest args)
+  "List functions/procedures with extra detail."
+  (isqlm--df-dispatch "df+" args))
+
+(defun isqlm/dfn+ (&rest args)
+  "List functions with extra detail."
+  (isqlm--df-dispatch "dfn+" args))
+
+(defun isqlm/dfp+ (&rest args)
+  "List procedures with extra detail."
+  (isqlm--df-dispatch "dfp+" args))
+
+(defun isqlm/dfS (&rest args)
+  "List functions/procedures including system routines."
+  (isqlm--df-dispatch "dfS" args))
+
+(defun isqlm/dfS+ (&rest args)
+  "List functions/procedures including system routines, with extra detail."
+  (isqlm--df-dispatch "dfS+" args))
+
+(defun isqlm/dfnS (&rest args)
+  "List functions including system routines."
+  (isqlm--df-dispatch "dfnS" args))
+
+(defun isqlm/dfpS (&rest args)
+  "List procedures including system routines."
+  (isqlm--df-dispatch "dfpS" args))
+
+(defun isqlm/dfnS+ (&rest args)
+  "List functions including system routines, with extra detail."
+  (isqlm--df-dispatch "dfnS+" args))
+
+(defun isqlm/dfpS+ (&rest args)
+  "List procedures including system routines, with extra detail."
+  (isqlm--df-dispatch "dfpS+" args))
 
 ;; Define the isqlm/ entry points for the command dispatcher
 (defun isqlm/d (&rest args)
