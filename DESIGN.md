@@ -51,6 +51,7 @@ ISQLM adopts an **Eshell-style architecture**: no dependency on `comint-mode`, n
 | `isqlm-history-ring` | ring | Input history ring buffer |
 | `isqlm-history-index` | integer/nil | Current history navigation position |
 | `isqlm-input-saved` | string/nil | Saved user input before history navigation |
+| `isqlm-delimiter` | string | Current statement delimiter (default `";"`) |
 
 ### 2.2 Four Key Markers
 
@@ -184,6 +185,7 @@ This expansion happens after statement splitting and before `isqlm--execute-sql`
 | `\status` | `isqlm/status` | Show connection status |
 | `\linestyle` | `isqlm/linestyle` | Set/cycle line-drawing style (ascii/unicode/none) |
 | `\timing` | `isqlm/timing` | Toggle/set query execution timing display |
+| `\delimiter` / `DELIMITER` | `isqlm/delimiter` | Set statement delimiter for stored programs |
 | `\d` | `isqlm/d` | List tables/views or describe a table |
 | `\d+` | `isqlm/d+` | Same with extra detail (engine, size, CREATE TABLE, partition info) |
 | `\dt` / `\dv` / `\di` | `isqlm/dt` etc. | List tables / views / indexes |
@@ -433,6 +435,53 @@ isqlm--do-connect
 2. **As a standalone command**: `\gset [PREFIX]` after a normal `SELECT ... ;` — uses the cached `isqlm-last-result` (saved by the preceding SELECT execution). Implemented by `isqlm/gset`.
 
 Both modes require exactly 1 row. Each column becomes an Emacs variable named `PREFIX` + column name.
+
+### Custom Delimiter (`DELIMITER` / `\delimiter`)
+
+MySQL CLI requires `DELIMITER` to change the statement terminator when creating stored programs (procedures, functions, triggers) that contain `;` inside `BEGIN...END` blocks.
+
+**Two ways to set**:
+- `DELIMITER //` — MySQL CLI compatible (no `\` prefix), recognized in both interactive prompt and scripts
+- `\delimiter //` — isqlm command style
+
+**Without argument**: resets to `;`.
+
+**How it works**:
+
+1. `isqlm-delimiter` (buffer-local, default `";"`) stores the current delimiter
+2. When delimiter ≠ `;`:
+   - `isqlm--sql-complete-p` checks for the custom delimiter instead of `;`/`\G`/`\gset`
+   - `isqlm--split-statements` delegates to `isqlm--split-statements-custom` (simple substring scan)
+   - `isqlm--strip-terminator` strips the custom delimiter
+3. When delimiter = `;`: all standard behavior is preserved (`\G`, `\gset`, etc.)
+4. In scripts (`\i FILE`), `isqlm--script-process-lines` recognizes `DELIMITER` directives via `isqlm--delimiter-directive-p`
+5. At the interactive prompt, `isqlm-send-input` recognizes `DELIMITER` before command dispatch
+
+**Example** (interactive):
+
+```
+SQL> \delimiter //
+Delimiter set to: //
+SQL> CREATE PROCEDURE p1()
+  -> BEGIN
+  -> SELECT * FROM t1;
+  -> END //
+Query OK, 0 rows affected
+SQL> \delimiter
+Delimiter reset to: ;
+```
+
+**Example** (script via `\i -`):
+
+```sql
+DELIMITER //
+CREATE PROCEDURE p1()
+BEGIN
+    SELECT * FROM t1;
+END //
+DELIMITER ;
+CALL p1();
+```
 
 ### Script Execution (`\i` / `\include`)
 

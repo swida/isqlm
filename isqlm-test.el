@@ -28,6 +28,7 @@ Sets up markers and variables without requiring mysql-el module."
            (isqlm-connection-info nil)
            (isqlm-last-query nil)
            (isqlm-last-result nil)
+           (isqlm-delimiter ";")
            (isqlm-last-input-start (point-min-marker))
            (isqlm-last-input-end (point-min-marker))
            (isqlm-last-output-start (point-min-marker))
@@ -408,5 +409,65 @@ Regression test: :varname was not expanded before eval."
     (should (= (isqlm--mysql-error-errno err) 1690))
     (should (equal (isqlm--mysql-error-sqlstate err) "22003"))
     (should (equal (isqlm--mysql-error-errmsg err) "BIGINT overflow"))))
+
+;; ============================================================
+;; Delimiter
+;; ============================================================
+
+(ert-deftest isqlm-test-delimiter-directive-p ()
+  "Test DELIMITER directive recognition."
+  ;; Basic
+  (should (equal (isqlm--delimiter-directive-p "DELIMITER //") "//"))
+  (should (equal (isqlm--delimiter-directive-p "delimiter //") "//"))
+  (should (equal (isqlm--delimiter-directive-p "Delimiter $$") "$$"))
+  ;; Reset
+  (should (equal (isqlm--delimiter-directive-p "DELIMITER ;") ";"))
+  (should (equal (isqlm--delimiter-directive-p "DELIMITER") ";"))
+  ;; Not a DELIMITER directive
+  (should-not (isqlm--delimiter-directive-p "SELECT 1;"))
+  (should-not (isqlm--delimiter-directive-p "DELIMITER_X"))
+  (should-not (isqlm--delimiter-directive-p "CREATE TABLE delimiter_log (id INT);")))
+
+(ert-deftest isqlm-test-sql-complete-custom-delimiter ()
+  "Test isqlm--sql-complete-p with custom delimiter."
+  (let ((isqlm-delimiter "//"))
+    ;; Complete with custom delimiter
+    (should (isqlm--sql-complete-p "END //"))
+    (should (isqlm--sql-complete-p "SELECT 1//"))
+    ;; Not complete with ;
+    (should-not (isqlm--sql-complete-p "SELECT 1;"))
+    ;; Not complete without delimiter
+    (should-not (isqlm--sql-complete-p "BEGIN"))
+    ;; Empty is always complete
+    (should (isqlm--sql-complete-p ""))))
+
+(ert-deftest isqlm-test-split-statements-custom-delimiter ()
+  "Test statement splitting with custom delimiter."
+  (let ((isqlm-delimiter "//"))
+    ;; Single statement
+    (should (equal (isqlm--split-statements "SELECT 1//")
+                   '("SELECT 1//")))
+    ;; Multiple statements
+    (should (equal (isqlm--split-statements "SELECT 1// SELECT 2//")
+                   '("SELECT 1//" "SELECT 2//")))
+    ;; Semicolons inside body are NOT split points
+    (should (equal (length (isqlm--split-statements
+                            "CREATE PROCEDURE p1()\nBEGIN\n  SELECT 1;\nEND //"))
+                   1))
+    ;; Don't split inside strings
+    (should (equal (length (isqlm--split-statements
+                            "SELECT '//'; SELECT 2//"))
+                   ;; With custom delimiter, ; is NOT a split point;
+                   ;; '//' inside quotes is skipped; trailing // is the
+                   ;; only delimiter, so it's one statement
+                   1))))
+
+(ert-deftest isqlm-test-strip-terminator-custom-delimiter ()
+  "Test isqlm--strip-terminator with custom delimiter."
+  (let ((isqlm-delimiter "//"))
+    (should (equal (isqlm--strip-terminator "END //")
+                   '("END" . nil)))
+    (should (equal (isqlm--strip-terminator "SELECT 1//")
+                   '("SELECT 1" . nil)))))
 
 ;;; isqlm-test.el ends here

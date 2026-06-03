@@ -32,6 +32,7 @@ through the [`mysql-el`](https://github.com/swida/mysql-el) dynamic module (C FF
 - **Execution timing** — `\timing` toggles display of query execution time (milliseconds, with human-readable breakdown for long queries)
 - **psql-style `\d` commands** — `\d`, `\dt`, `\dv`, `\di`, `\d+` for listing and describing tables, views, and indexes; `\d+ TABLE` shows partition info for partitioned tables
 - **psql-style `\df` commands** — `\df`, `\dfn`, `\dfp`, `\df+` for listing functions and procedures with optional argument-type filtering
+- **Custom delimiter** — `DELIMITER //` or `\delimiter //` for creating stored procedures, functions, and triggers
 
 ## Requirements
 
@@ -208,6 +209,7 @@ All built-in commands are prefixed with `\`:
 | `\status` | Show connection status |
 | `\linestyle [ascii\|unicode\|none]` | Set or cycle table border style (abbreviations: `a`, `u`, `n`) |
 | `\timing [on\|off]` | Toggle display of query execution time |
+| `\delimiter DELIM` / `DELIMITER DELIM` | Set statement delimiter (e.g. `//`, `$$`) for stored programs |
 | `\d [TABLE]` | List tables/views, or describe TABLE (columns + indexes) |
 | `\d+ [TABLE]` | Same with extra detail (engine, size, CREATE TABLE, partition info) |
 | `\dt [PATTERN]` | List tables (`\dt+` for detail) |

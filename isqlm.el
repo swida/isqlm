@@ -205,6 +205,11 @@ Set temporarily by \\d-family commands.")
 (defvar-local isqlm-timing nil
   "When non-nil, display execution time after each SQL statement.")
 
+(defvar-local isqlm-delimiter ";"
+  "Current statement delimiter.
+Use \\delimiter to change it (e.g. \\delimiter // for stored procedures).
+Reset to \";\" with \\delimiter ; or \\delimiter without arguments.")
+
 (defun isqlm--format-timing (elapsed)
   "Format ELAPSED seconds into a human-readable timing string.
 Returns e.g. \"Time: 42.531 ms\", \"Time: 1234.567 ms (1 s)\",
@@ -569,21 +574,31 @@ Returns non-nil if reconnection succeeded."
 
 (defun isqlm--sql-complete-p (sql)
   "Return non-nil if SQL is a complete statement.
-Complete if it ends with `;', `\\G', or `\\gset [PREFIX]'."
+When `isqlm-delimiter' is \";\", complete if it ends with `;', `\\G',
+or `\\gset [PREFIX]'.  With a custom delimiter, complete if it ends
+with that delimiter."
   (let ((trimmed (string-trim-right sql)))
-    (or (string-suffix-p ";" trimmed)
-        (string-suffix-p "\\G" trimmed)
-        (string-match-p "\\\\gset\\(?:\\s-+\\S-+\\)?\\s-*$" trimmed)
-        (string= trimmed ""))))
+    (or (string= trimmed "")
+        (if (string= isqlm-delimiter ";")
+            (or (string-suffix-p ";" trimmed)
+                (string-suffix-p "\\G" trimmed)
+                (string-match-p "\\\\gset\\(?:\\s-+\\S-+\\)?\\s-*$" trimmed))
+          (string-suffix-p isqlm-delimiter trimmed)))))
 
 (defun isqlm--strip-terminator (sql)
   "Remove trailing terminator from SQL.
 Return (BODY . MODE) where MODE is:
-  nil       — normal (terminated by `;')
+  nil       — normal (terminated by `;' or custom delimiter)
   t         — vertical display (terminated by `\\G')
   (:gset PREFIX) — store result as variables (terminated by `\\gset [PREFIX]')"
   (let ((trimmed (string-trim-right sql)))
     (cond
+     ;; Custom delimiter — strip it, no \G or \gset support
+     ((and (not (string= isqlm-delimiter ";"))
+           (string-suffix-p isqlm-delimiter trimmed))
+      (cons (string-trim-right
+             (substring trimmed 0 (- (length trimmed) (length isqlm-delimiter))))
+            nil))
      ((string-match "\\\\gset\\(?:\\s-+\\(\\S-+\\)\\)?\\s-*$" trimmed)
       (let* ((prefix (or (match-string 1 trimmed) ""))
              (body (string-trim-right (substring trimmed 0 (match-beginning 0)))))
@@ -702,7 +717,74 @@ backtick identifiers, and comments.  Variable values are formatted as:
 
 (defun isqlm--split-statements (sql)
   "Split SQL into a list of individual statements.
-Each element is a complete statement including its terminator (`;' or `\\G').
+Each element is a complete statement including its terminator.
+When `isqlm-delimiter' is \";\", handles `;', `\\G', and `\\gset'.
+With a custom delimiter, splits only on that delimiter.
+Handles quoted strings and comments to avoid splitting inside them."
+  (if (not (string= isqlm-delimiter ";"))
+      ;; Custom delimiter mode — simple substring scanning
+      (isqlm--split-statements-custom sql isqlm-delimiter)
+    ;; Standard ; mode — full parser
+    (isqlm--split-statements-standard sql)))
+
+(defun isqlm--split-statements-custom (sql delimiter)
+  "Split SQL by custom DELIMITER, respecting quotes and comments.
+Returns a list of statements; each includes its trailing delimiter."
+  (let ((len (length sql))
+        (dlen (length delimiter))
+        (i 0)
+        (start 0)
+        (statements nil)
+        (in-single-quote nil)
+        (in-double-quote nil)
+        (in-backtick nil)
+        (in-line-comment nil)
+        (in-block-comment nil))
+    (while (< i len)
+      (let ((ch (aref sql i)))
+        (cond
+         (in-line-comment
+          (when (= ch ?\n) (setq in-line-comment nil)))
+         (in-block-comment
+          (when (and (= ch ?*) (< (1+ i) len) (= (aref sql (1+ i)) ?/))
+            (setq in-block-comment nil)
+            (cl-incf i)))
+         (in-single-quote
+          (when (= ch ?')
+            (if (and (< (1+ i) len) (= (aref sql (1+ i)) ?'))
+                (cl-incf i)
+              (setq in-single-quote nil))))
+         (in-double-quote
+          (when (= ch ?\") (setq in-double-quote nil)))
+         (in-backtick
+          (when (= ch ?`) (setq in-backtick nil)))
+         (t
+          (cond
+           ((= ch ?') (setq in-single-quote t))
+           ((= ch ?\") (setq in-double-quote t))
+           ((= ch ?`) (setq in-backtick t))
+           ((and (= ch ?-) (< (1+ i) len) (= (aref sql (1+ i)) ?-))
+            (setq in-line-comment t) (cl-incf i))
+           ((= ch ?#) (setq in-line-comment t))
+           ((and (= ch ?/) (< (1+ i) len) (= (aref sql (1+ i)) ?*))
+            (setq in-block-comment t) (cl-incf i))
+           ;; Check for custom delimiter match
+           ((and (<= (+ i dlen) len)
+                 (string= (substring sql i (+ i dlen)) delimiter))
+            (let ((stmt (string-trim (substring sql start (+ i dlen)))))
+              (when (> (length stmt) 0)
+                (push stmt statements)))
+            (setq i (+ i dlen -1))
+            (setq start (+ i 1)))))))
+      (cl-incf i))
+    ;; Remainder
+    (let ((rest (string-trim (substring sql start))))
+      (when (> (length rest) 0)
+        (push rest statements)))
+    (nreverse statements)))
+
+(defun isqlm--split-statements-standard (sql)
+  "Split SQL by standard terminators (`;', `\\G', `\\gset').
 Handles quoted strings and comments to avoid splitting inside them."
   (let ((len (length sql))
         (i 0)
@@ -1355,6 +1437,8 @@ _SQL is the original statement (unused), MODE is the terminator mode."
     "  \\history               show input history\n"
     "  \\linestyle [a|u|n]     set border style (ascii/unicode/none)\n"
     "  \\timing [on|off]       toggle query execution timing\n"
+    "  \\delimiter DELIM       set statement delimiter (e.g. // $$)\n"
+    "  DELIMITER DELIM        same, MySQL CLI compatible (no \\ prefix)\n"
     "\n"
     "Informational (psql-style)\n"
     "  \\d [TABLE]             list tables/views, or describe TABLE\n"
@@ -1633,6 +1717,21 @@ Without argument, toggle."
      (t
       (isqlm--output-error "Usage: \\timing [on|off]\n")))))
 
+(defun isqlm/delimiter (&rest args)
+  "Set or reset the statement delimiter.
+\\delimiter DELIM sets the delimiter to DELIM (e.g. // or $$).
+\\delimiter without argument resets to \";\".
+This is needed for CREATE PROCEDURE/FUNCTION/TRIGGER statements
+that contain `;' inside BEGIN...END blocks."
+  (let ((new-delim (car args)))
+    (if new-delim
+        (progn
+          (setq isqlm-delimiter new-delim)
+          (isqlm--output-info
+           (format "Delimiter set to: %s\n" isqlm-delimiter)))
+      (setq isqlm-delimiter ";")
+      (isqlm--output-info "Delimiter reset to: ;\n"))))
+
 (defun isqlm/eval (&rest args)
   "Evaluate an Elisp expression.  ARGS are joined and read as a sexp.
 Examples:
@@ -1687,10 +1786,19 @@ Each SQL statement is executed via the async pipeline."
         (buf (current-buffer)))
     (isqlm--script-process-lines lines "" buf)))
 
+(defun isqlm--delimiter-directive-p (line)
+  "Return the new delimiter if LINE is a DELIMITER directive, nil otherwise.
+Recognizes `DELIMITER //' style directives (case-insensitive).
+Without argument, returns \";\" to reset."
+  (when (string-match "\\`[Dd][Ee][Ll][Ii][Mm][Ii][Tt][Ee][Rr]\\(?:\\s-+\\(\\S-+\\)\\)?\\s-*\\'"
+                       line)
+    (or (match-string 1 line) ";")))
+
 (defun isqlm--script-process-lines (lines pending buf)
   "Process LINES from a script with PENDING accumulated input in BUF.
 Async: when a SQL statement is found, execute it and continue
-processing remaining lines in the callback."
+processing remaining lines in the callback.
+Recognizes DELIMITER directives (MySQL CLI compatible)."
   (if (null lines)
       ;; End of script — check for unterminated input
       (when (> (length (string-trim pending)) 0)
@@ -1702,42 +1810,52 @@ processing remaining lines in the callback."
                        (string-trim pending)))))))
     (let* ((line (car lines))
            (rest (cdr lines))
-           (new-pending (concat pending
-                                (if (string= pending "") "" "\n")
-                                line))
-           (trimmed (string-trim new-pending)))
+           (line-trimmed (string-trim line)))
       (when (buffer-live-p buf)
         (with-current-buffer buf
-          (cond
-           ;; Built-in command on its own line (no multi-line pending)
-           ((and (not (string-match-p "\n" new-pending))
-                 (string-prefix-p "\\" trimmed))
-            (cond
-             ;; Conditional flow commands — always process, then continue
-             ((isqlm--cond-flow-command-p trimmed)
-              (isqlm--process-cond-flow trimmed)
-              (isqlm--script-process-lines rest "" buf))
-             ;; Other commands — only when active (async via callback)
-             ((isqlm--cond-active-p)
-              (isqlm--execute-line
-               new-pending
-               (lambda ()
-                 (isqlm--script-process-lines rest "" buf))))
-             ;; Inactive — skip command, continue
-             (t
-              (isqlm--script-process-lines rest "" buf))))
-           ;; Complete SQL — execute only when active
-           ((isqlm--sql-complete-p new-pending)
-            (if (isqlm--cond-active-p)
-                (let ((statements (isqlm--split-statements new-pending)))
-                  (isqlm--async-run-statements
-                   statements buf
-                   (lambda ()
-                     (isqlm--script-process-lines rest "" buf))))
-              (isqlm--script-process-lines rest "" buf)))
-           ;; Incomplete — accumulate and continue
-           (t
-            (isqlm--script-process-lines rest new-pending buf))))))))
+          ;; DELIMITER directive — must appear on its own line, no pending SQL
+          (let ((new-delim (and (string= (string-trim pending) "")
+                                (isqlm--delimiter-directive-p line-trimmed))))
+            (if new-delim
+                (progn
+                  (setq isqlm-delimiter new-delim)
+                  (isqlm--script-process-lines rest "" buf))
+              ;; Normal processing
+              (let* ((new-pending (concat pending
+                                         (if (string= pending "") "" "\n")
+                                         line))
+                     (trimmed (string-trim new-pending)))
+                (cond
+                 ;; Built-in command on its own line (no multi-line pending)
+                 ((and (not (string-match-p "\n" new-pending))
+                       (string-prefix-p "\\" trimmed))
+                  (cond
+                   ;; Conditional flow commands — always process, then continue
+                   ((isqlm--cond-flow-command-p trimmed)
+                    (isqlm--process-cond-flow trimmed)
+                    (isqlm--script-process-lines rest "" buf))
+                   ;; Other commands — only when active (async via callback)
+                   ((isqlm--cond-active-p)
+                    (isqlm--execute-line
+                     new-pending
+                     (lambda ()
+                       (isqlm--script-process-lines rest "" buf))))
+                   ;; Inactive — skip command, continue
+                   (t
+                    (isqlm--script-process-lines rest "" buf))))
+                 ;; Complete SQL — execute only when active
+                 ((isqlm--sql-complete-p new-pending)
+                  (if (isqlm--cond-active-p)
+                      (let ((statements (isqlm--split-statements new-pending)))
+                        (isqlm--async-run-statements
+                         statements buf
+                         (lambda ()
+                           (isqlm--script-process-lines rest "" buf))))
+                    (isqlm--script-process-lines rest "" buf)))
+                 ;; Incomplete — accumulate and continue
+                 (t
+                  (isqlm--script-process-lines rest new-pending buf)))))))))))
+
 
 ;; Minor mode for \i - editing buffer
 (defvar-local isqlm--script-target nil
@@ -2929,6 +3047,20 @@ Otherwise, insert a continuation prompt for multi-line input."
        ((not (isqlm--cond-active-p))
         (setq isqlm-pending-input "")
         (isqlm--emit-prompt))
+
+       ;; DELIMITER directive (MySQL CLI compatible, no \ prefix)
+       ((and (string= isqlm-pending-input "")
+             (isqlm--delimiter-directive-p (string-trim accumulated)))
+        (let ((new-delim (isqlm--delimiter-directive-p
+                          (string-trim accumulated))))
+          (setq isqlm-delimiter new-delim)
+          (isqlm--add-to-history accumulated)
+          (setq isqlm-pending-input "")
+          (isqlm--output-info
+           (if (string= new-delim ";")
+               "Delimiter reset to: ;\n"
+             (format "Delimiter set to: %s\n" new-delim)))
+          (isqlm--emit-prompt)))
 
        ;; If no pending input, try builtin command first
        ((and (string= isqlm-pending-input "")
