@@ -336,9 +336,7 @@ Inspired by PostgreSQL's `\ef`. Fetches a stored function/procedure definition a
 3. **With argument types**: Uses `INFORMATION_SCHEMA.PARAMETERS` to disambiguate overloaded names
 4. Opens `*isqlm-ef*` buffer with `sql-mode` + `isqlm-ef-mode` (C-c C-c / C-c C-k)
 5. Strips `DEFINER=...` clause for cleaner editing
-6. On C-c C-c:
-   - If text ends with `;` → executes immediately via async pipeline
-   - Otherwise → places text in the ISQLM input area for review
+6. On C-c C-c: executes the definition immediately (auto-appends `;` if missing)
 7. On C-c C-k → discards changes
 
 **No DELIMITER needed**: The definition is sent as a single statement directly to `mysql-query`, bypassing the statement splitter entirely.

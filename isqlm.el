@@ -2482,8 +2482,7 @@ RAW-CMD is the command name without \\, ARGS is the argument list."
 (defun isqlm-ef-finish ()
   "Execute the edited function definition and close the buffer.
 The entire buffer content is sent as a single SQL statement.
-If the text ends with `;', it is executed immediately.
-Otherwise, it is sent to the ISQLM input area for review."
+A trailing semicolon is added automatically if missing."
   (interactive)
   (let ((text (string-trim (buffer-substring-no-properties
                             (point-min) (point-max))))
@@ -2493,19 +2492,15 @@ Otherwise, it is sent to the ISQLM input area for review."
     (kill-buffer buf)
     (when (and target (buffer-live-p target))
       (with-current-buffer target
-        (if (string-suffix-p ";" text)
-            ;; Ends with ; — execute immediately
-            (progn
-              (setq isqlm--async-busy t)
-              (isqlm--async-execute-one
-               text target
-               (lambda ()
-                 (setq isqlm--async-busy nil)
-                 (isqlm--emit-prompt))))
-          ;; No terminator — put into the input area for review
-          (isqlm--replace-current-input text)
-          (goto-char (point-max))
-          (message "Definition loaded.  Add ; and press RET to execute, or C-c C-c to cancel."))))))
+        ;; Ensure trailing semicolon
+        (unless (string-suffix-p ";" text)
+          (setq text (concat text ";")))
+        (setq isqlm--async-busy t)
+        (isqlm--async-execute-one
+         text target
+         (lambda ()
+           (setq isqlm--async-busy nil)
+           (isqlm--emit-prompt)))))))
 
 (defun isqlm-ef-abort ()
   "Abort editing the function definition."
