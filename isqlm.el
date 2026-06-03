@@ -1449,6 +1449,7 @@ _SQL is the original statement (unused), MODE is the terminator mode."
     "  \\df[np][S][+] [PATTERN [ARG_PATTERN ...]]\n"
     "                         list functions/procedures\n"
     "                         n=normal(function) p=procedure S=system +=detail\n"
+    "  \\ef [NAME[(types)]]    edit function/procedure definition\n"
     "  PATTERN: * matches any, ? matches one character\n"
     "\n"
     "Control Flow\n"
@@ -2459,6 +2460,189 @@ RAW-CMD is the command name without \\, ARGS is the argument list."
   "List procedures including system routines, with extra detail."
   (isqlm--df-dispatch "dfpS+" args))
 
+;; ============================================================
+;; \ef — edit function/procedure definition (psql-style)
+;; ============================================================
+
+(defvar isqlm-ef-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-c C-c") #'isqlm-ef-finish)
+    (define-key map (kbd "C-c C-k") #'isqlm-ef-abort)
+    map)
+  "Keymap for `isqlm-ef-mode'.")
+
+(define-minor-mode isqlm-ef-mode
+  "Minor mode for editing a function/procedure definition.
+\\<isqlm-ef-mode-map>
+\\[isqlm-ef-finish] to execute (save) the definition.
+\\[isqlm-ef-abort] to discard changes."
+  :lighter " ISQLM-EF"
+  :keymap isqlm-ef-mode-map)
+
+(defun isqlm-ef-finish ()
+  "Execute the edited function definition and close the buffer.
+The entire buffer content is sent as a single SQL statement.
+If the text ends with `;', it is executed immediately.
+Otherwise, it is sent to the ISQLM input area for review."
+  (interactive)
+  (let ((text (string-trim (buffer-substring-no-properties
+                            (point-min) (point-max))))
+        (target isqlm--script-target)
+        (buf (current-buffer)))
+    (quit-window)
+    (kill-buffer buf)
+    (when (and target (buffer-live-p target))
+      (with-current-buffer target
+        (if (string-suffix-p ";" text)
+            ;; Ends with ; — execute immediately
+            (progn
+              (setq isqlm--async-busy t)
+              (isqlm--async-execute-one
+               text target
+               (lambda ()
+                 (setq isqlm--async-busy nil)
+                 (isqlm--emit-prompt))))
+          ;; No terminator — put into the input area for review
+          (isqlm--replace-current-input text)
+          (goto-char (point-max))
+          (message "Definition loaded.  Add ; and press RET to execute, or C-c C-c to cancel."))))))
+
+(defun isqlm-ef-abort ()
+  "Abort editing the function definition."
+  (interactive)
+  (let ((buf (current-buffer)))
+    (quit-window)
+    (kill-buffer buf)
+    (message "Function editing aborted.")))
+
+(defun isqlm/ef (&rest args)
+  "Edit a function or procedure definition (psql-style \\ef).
+\\ef NAME — fetch and edit the named function/procedure.
+\\ef NAME(type1, type2) — specify argument types if ambiguous.
+\\ef without argument — open a blank CREATE FUNCTION template.
+The entire remainder of the line is taken as the argument.
+C-c C-c to execute, C-c C-k to discard."
+  (if (not (isqlm--connected-p))
+      (isqlm--output-error "Not connected.\n")
+    (let* ((raw-arg (car args))
+           (name nil)
+           (arg-types nil))
+      ;; Parse: "func_name" or "func_name(int, varchar)"
+      (when raw-arg
+        (if (string-match "\\`\\([^(]+\\)\\(?:(\\(.*\\))\\)?\\'" raw-arg)
+            (progn
+              (setq name (string-trim (match-string 1 raw-arg)))
+              (when (match-string 2 raw-arg)
+                (setq arg-types (match-string 2 raw-arg))))
+          (setq name (string-trim raw-arg))))
+      (if (not name)
+          ;; No function specified — blank template
+          (isqlm--ef-open-editor
+           (concat "CREATE FUNCTION function_name()\n"
+                   "RETURNS INT\n"
+                   "DETERMINISTIC\n"
+                   "BEGIN\n"
+                   "    RETURN 0;\n"
+                   "END")
+           nil)
+        ;; Fetch the function/procedure definition
+        (isqlm--ef-fetch-and-edit name arg-types)))))
+
+(defun isqlm--ef-fetch-and-edit (name arg-types)
+  "Fetch the definition of NAME and open it in an editor.
+ARG-TYPES is a comma-separated type list for disambiguation, or nil."
+  (let* ((q-name (replace-regexp-in-string "'" "''" name))
+         ;; First determine routine type
+         (info-sql
+          (concat "SELECT ROUTINE_TYPE, ROUTINE_SCHEMA"
+                  " FROM INFORMATION_SCHEMA.ROUTINES"
+                  " WHERE ROUTINE_SCHEMA = DATABASE()"
+                  " AND ROUTINE_NAME = '" q-name "'"
+                  (when arg-types
+                    ;; Count matching parameters to disambiguate
+                    (let* ((types (split-string arg-types "," t "[ \t]+"))
+                           (clauses
+                            (cl-loop for tp in types
+                                     for pos from 1
+                                     collect (format
+                                              (concat "EXISTS (SELECT 1 FROM"
+                                                      " INFORMATION_SCHEMA.PARAMETERS p"
+                                                      " WHERE p.SPECIFIC_SCHEMA = r.ROUTINE_SCHEMA"
+                                                      " AND p.SPECIFIC_NAME = r.ROUTINE_NAME"
+                                                      " AND p.ORDINAL_POSITION = %d"
+                                                      " AND p.DATA_TYPE LIKE '%s')")
+                                              pos
+                                              (string-trim tp)))))
+                      (concat " AND "
+                              (mapconcat #'identity clauses " AND "))))
+                  " LIMIT 1"))
+         (info-result
+          (condition-case err
+              (isqlm-execute-string info-sql)
+            (error
+             (isqlm--output-mysql-error err)
+             nil))))
+    (if (or (not info-result) (null (plist-get info-result :rows)))
+        (isqlm--output-error
+         (format "Function or procedure \"%s\" not found.\n" name))
+      (let* ((row (car (plist-get info-result :rows)))
+             (routine-type (nth 0 row))  ; "FUNCTION" or "PROCEDURE"
+             (show-cmd (if (string= routine-type "PROCEDURE")
+                           (format "SHOW CREATE PROCEDURE `%s`"
+                                   (replace-regexp-in-string "`" "``" name))
+                         (format "SHOW CREATE FUNCTION `%s`"
+                                 (replace-regexp-in-string "`" "``" name))))
+             (create-result
+              (condition-case err
+                  (isqlm-execute-string show-cmd)
+                (error
+                 (isqlm--output-mysql-error err)
+                 nil))))
+        (if (or (not create-result) (null (plist-get create-result :rows)))
+            (isqlm--output-error
+             (format "Cannot fetch definition for %s \"%s\".\n"
+                     (downcase routine-type) name))
+          ;; Extract CREATE statement (column index 2 in SHOW CREATE output)
+          (let* ((create-row (car (plist-get create-result :rows)))
+                 (create-sql (nth 2 create-row)))
+            (if (or (null create-sql) (string= create-sql ""))
+                (isqlm--output-error
+                 (format "Definition not available (no SHOW CREATE privilege?).\n"))
+              ;; Transform to CREATE OR REPLACE (MySQL 10.1.1+ / MariaDB)
+              ;; For standard MySQL, just use DROP + CREATE or plain CREATE
+              (let ((edit-sql (isqlm--ef-prepare-sql create-sql routine-type)))
+                (isqlm--ef-open-editor edit-sql nil)))))))))
+
+(defun isqlm--ef-prepare-sql (create-sql _routine-type)
+  "Prepare CREATE-SQL for editing.
+Strips any DEFINER clause for cleaner editing.
+_ROUTINE-TYPE is \"FUNCTION\" or \"PROCEDURE\"."
+  ;; Remove DEFINER=`user`@`host` clause for cleaner editing
+  (let ((sql (replace-regexp-in-string
+              "\\s-*DEFINER=`[^`]*`@`[^`]*`\\s-*" " "
+              create-sql)))
+    ;; Ensure consistent formatting
+    (string-trim sql)))
+
+(defun isqlm--ef-open-editor (text line-number)
+  "Open an editor buffer with TEXT for function editing.
+If LINE-NUMBER is non-nil, position cursor on that line."
+  (let ((target (current-buffer))
+        (buf (generate-new-buffer "*isqlm-ef*")))
+    (setq isqlm--async-busy t)  ; prevent prompt emission
+    (pop-to-buffer buf)
+    (sql-mode)
+    (isqlm-ef-mode 1)
+    (setq isqlm--script-target target)
+    (insert text)
+    (goto-char (point-min))
+    (when (and line-number (> line-number 1))
+      (forward-line (1- line-number)))
+    (setq header-line-format
+          "Edit function.  C-c C-c to execute, C-c C-k to discard.")
+    (set-buffer-modified-p nil)
+    (message "Edit function definition.  C-c C-c to execute, C-c C-k to discard.")))
+
 ;; Define the isqlm/ entry points for the command dispatcher
 (defun isqlm/d (&rest args)
   "Describe tables/views (psql-style).  See \\help for details."
@@ -2898,8 +3082,8 @@ nil if it should be treated as SQL."
       (unless (string= (upcase first) "\\G")
         (let* ((raw-cmd (downcase (substring first 1)))
                (cmd (or (cdr (assoc raw-cmd isqlm-command-aliases)) raw-cmd))
-               ;; For \eval, pass the raw rest of the line (not tokenized)
-               (args (if (string= cmd "eval")
+               ;; For \eval and \ef, pass the raw rest of the line (not tokenized)
+               (args (if (member cmd '("eval" "ef"))
                          (let ((rest (string-trim
                                       (substring trimmed (length first)))))
                            (and (> (length rest) 0) (list rest)))

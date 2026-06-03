@@ -190,6 +190,7 @@ This expansion happens after statement splitting and before `isqlm--execute-sql`
 | `\d+` | `isqlm/d+` | Same with extra detail (engine, size, CREATE TABLE, partition info) |
 | `\dt` / `\dv` / `\di` | `isqlm/dt` etc. | List tables / views / indexes |
 | `\df[np][S][+]` | `isqlm/df` etc. | List functions / procedures |
+| `\ef [NAME[(types)]]` | `isqlm/ef` | Edit function/procedure definition |
 | `\eval` | `isqlm/eval` | Evaluate arbitrary Elisp expression |
 | `\echo` | `isqlm/echo` | Output text with variable expansion |
 | `\for` | `isqlm--for-start` | Loop over values with `{ body }` |
@@ -321,6 +322,41 @@ MySQL does not have aggregate, trigger, or window function types in `INFORMATION
 | Owner | `DEFINER` |
 | Security | `SECURITY_TYPE` (`DEFINER` or `INVOKER`) |
 | Description | `ROUTINE_COMMENT` |
+
+## 4.4 Editing Functions/Procedures (`\ef`)
+
+Inspired by PostgreSQL's `\ef`. Fetches a stored function/procedure definition and opens it in an editing buffer.
+
+**Syntax**: `\ef [NAME[(type1, type2, ...)]]`
+
+**Workflow**:
+
+1. **No argument**: Opens a blank `CREATE FUNCTION` template
+2. **With name**: Queries `INFORMATION_SCHEMA.ROUTINES` to determine type (FUNCTION/PROCEDURE), then `SHOW CREATE FUNCTION/PROCEDURE` to fetch the definition
+3. **With argument types**: Uses `INFORMATION_SCHEMA.PARAMETERS` to disambiguate overloaded names
+4. Opens `*isqlm-ef*` buffer with `sql-mode` + `isqlm-ef-mode` (C-c C-c / C-c C-k)
+5. Strips `DEFINER=...` clause for cleaner editing
+6. On C-c C-c:
+   - If text ends with `;` → executes immediately via async pipeline
+   - Otherwise → places text in the ISQLM input area for review
+7. On C-c C-k → discards changes
+
+**No DELIMITER needed**: The definition is sent as a single statement directly to `mysql-query`, bypassing the statement splitter entirely.
+
+**Key difference from `\i -`**: The `\ef` editing buffer executes its content as a single SQL statement (not as a multi-line script). This means `;` inside `BEGIN...END` blocks does not cause splitting issues.
+
+**Implementation**:
+
+| Function | Description |
+|----------|-------------|
+| `isqlm/ef` | Entry point: parse name/types, dispatch to fetch or template |
+| `isqlm--ef-fetch-and-edit` | Query INFORMATION_SCHEMA + SHOW CREATE, open editor |
+| `isqlm--ef-prepare-sql` | Strip DEFINER clause from CREATE statement |
+| `isqlm--ef-open-editor` | Create `*isqlm-ef*` buffer with `sql-mode` + `isqlm-ef-mode` |
+| `isqlm-ef-finish` | C-c C-c: execute or place in input area |
+| `isqlm-ef-abort` | C-c C-k: discard |
+
+**Command dispatch note**: `\ef` receives the raw rest of the line (not tokenized), same as `\eval`. This allows function names with parentheses like `foo(integer, text)` to be passed intact.
 
 ## 5. SQL Execution Layer
 

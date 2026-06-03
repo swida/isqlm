@@ -216,6 +216,7 @@ All built-in commands are prefixed with `\`:
 | `\dv [PATTERN]` | List views (`\dv+` for detail) |
 | `\di [TABLE]` | List indexes (all or for TABLE) |
 | `\df[np][S][+] [PATTERN [ARG_PATTERN ...]]` | List functions/procedures (`n`=functions, `p`=procedures, `S`=system, `+`=detail) |
+| `\ef [NAME[(types)]]` | Edit function/procedure definition (C-c C-c to execute, C-c C-k to discard) |
 | `\eval EXPRESSION` | Evaluate an Elisp expression |
 | `\clear` | Clear buffer |
 | `\history` | Show input history |
