@@ -199,6 +199,7 @@ This expansion happens after statement splitting and before `isqlm--execute-sql`
 | `\else` | `isqlm/else` | Else branch |
 | `\endif` | `isqlm/endif` | End conditional block |
 | `\gset` | `isqlm/gset` | Store last query result as variables |
+| `\genddl` | `isqlm/genddl` | Generate DDL+DML for tables referenced in SQL |
 | `\i`/`\include` | `isqlm/i` | Execute SQL from file (`-` for script editor) |
 | `\clear` | `isqlm/clear` | Clear buffer |
 | `\history` | `isqlm/history` | Show history |
@@ -355,6 +356,53 @@ Inspired by PostgreSQL's `\ef`. Fetches a stored function/procedure definition a
 | `isqlm-ef-abort` | C-c C-k: discard |
 
 **Command dispatch note**: `\ef` receives the raw rest of the line (not tokenized), same as `\eval`. This allows function names with parentheses like `foo(integer, text)` to be passed intact.
+
+## 4.5 Generate DDL/DML from SQL (`\genddl`)
+
+Generates `CREATE TABLE` and `INSERT INTO` statements for all tables referenced in a SQL query. Useful for creating minimal reproducible test cases.
+
+**Requires a live database connection.**
+
+**Syntax**: `\genddl SQL-STATEMENT`
+
+Without an argument, uses the last executed SQL (`isqlm-last-query`).
+
+**Example**:
+
+```
+SQL> \genddl select sum(b) over (partition by(a)) from t3 t
+CREATE TABLE `t3` (
+  `a` int DEFAULT NULL,
+  `b` int DEFAULT NULL,
+  `c` int DEFAULT NULL,
+  KEY `a` (`a`,`b`)
+) ENGINE=ROCKSDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+INSERT INTO `t3` (`a`, `b`, `c`) VALUES
+(1, 2, 3),
+(4, 5, 6);
+```
+
+**How it works**:
+
+1. **Table extraction via EXPLAIN** (`isqlm--genddl-extract-tables-via-explain`): Runs `EXPLAIN <sql>` and collects unique table names from the `table` column. This leverages MySQL's own SQL parser, correctly handling subqueries, CTEs, hints, aliases, comma-separated FROM lists, etc. Derived tables (`<derived2>`, `<subquery1>`) are filtered out. If EXPLAIN fails (syntax error, missing table, etc.), the error is reported directly.
+
+2. **Real DDL fetch** (`isqlm--genddl-fetch-create-table`): Issues `SHOW CREATE TABLE` for each table. Uses the real DDL verbatim.
+
+3. **Column parsing** (`isqlm--genddl-parse-columns-from-ddl`): Extracts column name/type pairs from the real DDL for DML generation.
+
+4. **Real data fetch** (`isqlm--genddl-fetch-data`): Issues `SELECT ... LIMIT 2` to get actual rows. Values are formatted type-aware via `isqlm--genddl-format-value` — numeric types (`int`, `decimal`, etc.) are unquoted, strings are single-quoted with proper escaping, NULLs output as `NULL`. If the table is empty, no INSERT statement is generated.
+
+**Implementation**:
+
+| Function | Description |
+|----------|-------------|
+| `isqlm/genddl` | Entry point: require connection, EXPLAIN, fetch DDL+data, output |
+| `isqlm--genddl-extract-tables-via-explain` | Extract table names using `EXPLAIN` |
+| `isqlm--genddl-fetch-create-table` | Fetch real DDL via `SHOW CREATE TABLE` |
+| `isqlm--genddl-parse-columns-from-ddl` | Parse column name/type from DDL string |
+| `isqlm--genddl-fetch-data` | Fetch real rows via `SELECT ... LIMIT` for DML |
+| `isqlm--genddl-format-value` | Format a value for INSERT — type-aware quoting |
 
 ## 5. SQL Execution Layer
 
@@ -782,6 +830,7 @@ emacs -batch -l isqlm.el -l isqlm-test.el -f ert-run-tests-batch-and-exit
 | Conditional Detection | `isqlm-test-cond-flow-command-p` | `isqlm--cond-flow-command-p` correctly identifies `\if`/`\elif`/`\else`/`\endif` and rejects others |
 | Display Width | `isqlm-test-display-width` | Multi-line string width calculation for table rendering |
 | Error Messages | `isqlm-test-error-message` | `isqlm--error-message` handles `mysql-error` structured signals `(mysql-error ERRNO SQLSTATE ERRMSG)`, generic `(error . "string")`, and standard `(error "fmt" args...)` formats; tests `isqlm--mysql-error-p` predicate and accessor functions |
+| DDL/DML Generation | `isqlm-test-genddl-parse-columns-from-ddl`, `isqlm-test-genddl-format-value` | DDL column parsing from `SHOW CREATE TABLE` output, type-aware value formatting (numeric unquoted, strings quoted, NULL handling) |
 
 ### Design Principles
 

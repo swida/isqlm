@@ -2638,6 +2638,190 @@ If LINE-NUMBER is non-nil, position cursor on that line."
     (set-buffer-modified-p nil)
     (message "Edit function definition.  C-c C-c to execute, C-c C-k to discard.")))
 
+;; ============================================================
+;; Generate DDL/DML from SQL (\genddl)
+;; ============================================================
+
+(defun isqlm--genddl-extract-tables-from-json (json-str)
+  "Extract real table names from EXPLAIN FORMAT=JSON output string.
+Scans for \"table_name\": \"...\" entries, skipping derived/subquery markers."
+  (let ((tables nil)
+        (pos 0))
+    (while (string-match "\"table_name\"[ \t\n]*:[ \t\n]*\"\\([^\"]+\\)\"" json-str pos)
+      (let ((tbl (match-string 1 json-str)))
+        (unless (or (string-match-p "\\`<" tbl)
+                    (member tbl tables))
+          (push tbl tables)))
+      (setq pos (match-end 0)))
+    (nreverse tables)))
+
+(defun isqlm--genddl-extract-tables-via-explain (sql)
+  "Extract real table names from SQL using EXPLAIN FORMAT=JSON.
+Returns a list of unique table name strings.
+Signals an error if EXPLAIN fails (e.g. syntax error, missing table)."
+  (let* ((explain-sql (format "EXPLAIN FORMAT=JSON %s" sql))
+         (result (isqlm-execute-string explain-sql))
+         (rows (plist-get result :rows)))
+    ;; EXPLAIN FORMAT=JSON returns a single row with a single column (the JSON)
+    (when (and rows (car rows) (car (car rows)))
+      (isqlm--genddl-extract-tables-from-json (car (car rows))))))
+
+(defun isqlm--genddl-resolve-alias (alias sql)
+  "Resolve ALIAS to a real table name by searching SQL text.
+Looks for patterns like `table AS alias' or `table alias' in FROM/JOIN clauses.
+Returns the real table name, or nil if not found."
+  (let ((case-fold-search t)
+        (alias-re (regexp-quote alias)))
+    ;; Match: table_name AS alias  or  table_name alias
+    (when (string-match
+           (concat "`?\\([a-zA-Z_][a-zA-Z0-9_]*\\)`?"
+                   "[ \t\n]+\\(?:[Aa][Ss][ \t\n]+\\)?"
+                   "`?" alias-re "`?"
+                   "\\(?:[ \t\n,;)]\\|\\'\\)")
+           sql)
+      (let ((candidate (match-string 1 sql)))
+        ;; Make sure the candidate is not a keyword
+        (unless (member (downcase candidate)
+                        '("from" "join" "inner" "left" "right" "outer"
+                          "cross" "natural" "straight_join" "select"
+                          "where" "on" "using" "into" "update" "table"
+                          "as" "set" "values"))
+          candidate)))))
+
+(defun isqlm--genddl-fetch-create-table (tbl-name)
+  "Fetch the CREATE TABLE statement for TBL-NAME from the server.
+Returns the DDL string or nil on failure."
+  (condition-case nil
+      (let* ((result (isqlm-execute-string
+                      (format "SHOW CREATE TABLE `%s`" tbl-name)))
+             (rows (plist-get result :rows)))
+        (when (and rows (car rows))
+          (nth 1 (car rows))))
+    (error nil)))
+
+(defun isqlm--genddl-parse-columns-from-ddl (ddl)
+  "Parse column names and types from a CREATE TABLE DDL string.
+Returns a list of (NAME . TYPE) pairs."
+  (let ((cols nil)
+        (pos 0))
+    (while (string-match
+            "^[ \t]+`\\([^`]+\\)`[ \t]+\\([a-zA-Z_][a-zA-Z0-9_(),]*\\)"
+            ddl pos)
+      (let ((name (match-string 1 ddl))
+            (type (match-string 2 ddl)))
+        (push (cons name type) cols))
+      (setq pos (match-end 0))
+      (when (string-match "\n" ddl pos)
+        (setq pos (match-end 0))))
+    (nreverse cols)))
+
+(defun isqlm--genddl-format-value (val col-type)
+  "Format VAL for INSERT INTO based on COL-TYPE.
+Numbers are unquoted, strings are single-quoted, NULL stays NULL."
+  (cond
+   ((null val) "NULL")
+   ;; Numeric types: output without quotes
+   ((and (stringp col-type)
+         (string-match-p "\\`\\(?:int\\|tinyint\\|smallint\\|mediumint\\|bigint\\|float\\|double\\|decimal\\|numeric\\|bit\\)" (downcase col-type)))
+    (if (and (stringp val) (string-match-p "\\`-?[0-9]*\\.?[0-9]+\\'" val))
+        val
+      (format "%s" val)))
+   ;; Everything else: quote as string
+   (t (format "'%s'"
+              (replace-regexp-in-string "'" "''" (format "%s" val))))))
+
+(defun isqlm--genddl-fetch-data (tbl-name col-types &optional num-rows)
+  "Fetch real data from TBL-NAME and format as INSERT INTO statement.
+COL-TYPES is a list of (NAME . TYPE).  NUM-ROWS defaults to 2.
+Returns the INSERT statement string, or nil if the table is empty."
+  (let ((num-rows (or num-rows 2)))
+    (condition-case nil
+        (let* ((col-names (mapcar #'car col-types))
+               (sql (format "SELECT %s FROM `%s` LIMIT %d"
+                            (mapconcat (lambda (c) (format "`%s`" c))
+                                       col-names ", ")
+                            tbl-name num-rows))
+               (result (isqlm-execute-string sql))
+               (rows (plist-get result :rows)))
+          (when (and rows (> (length rows) 0))
+            (let ((value-rows nil))
+              (dolist (row rows)
+                (let ((formatted-vals nil)
+                      (i 0))
+                  (dolist (val row)
+                    (push (isqlm--genddl-format-value
+                           val (cdr (nth i col-types)))
+                          formatted-vals)
+                    (cl-incf i))
+                  (push (concat "(" (mapconcat #'identity
+                                               (nreverse formatted-vals) ", ")
+                                ")")
+                        value-rows)))
+              (concat
+               "INSERT INTO `" tbl-name "` ("
+               (mapconcat (lambda (c) (format "`%s`" c)) col-names ", ")
+               ") VALUES\n"
+               (mapconcat #'identity (nreverse value-rows) ",\n")
+               ";\n"))))
+      (error nil))))
+
+(defun isqlm/genddl (&rest args)
+  "Generate CREATE TABLE and INSERT statements for tables referenced in SQL.
+Usage: \\genddl SQL-STATEMENT
+If no argument, uses the last executed SQL query.
+
+Requires a live database connection.  Uses EXPLAIN to extract table names,
+SHOW CREATE TABLE for DDL, and SELECT for sample data.
+
+Example:
+  \\genddl select t1.a, t2.b from t1 join t2 on t1.id = t2.t1_id
+Produces DDL+DML for t1 and t2."
+  (let* ((sql (if args
+                  (string-trim (mapconcat #'identity args " "))
+                (or isqlm-last-query "")))
+         (sql (if (string= sql "")
+                  (progn (isqlm--output-error "No SQL provided.  Usage: \\genddl SELECT ...\n")
+                         nil)
+                sql)))
+    (when sql
+      (unless (isqlm--connected-p)
+        (isqlm--output-error "Not connected.  \\genddl requires a database connection.\n")
+        (setq sql nil))
+      (when sql
+        ;; Strip trailing ; or \G for EXPLAIN compatibility
+        (let ((clean-sql (replace-regexp-in-string
+                          "\\(?:;\\|\\\\[Gg]\\)[ \t]*\\'" "" sql)))
+          (condition-case err
+              (let ((table-names (isqlm--genddl-extract-tables-via-explain clean-sql)))
+                (if (null table-names)
+                    (isqlm--output-error "No tables found in EXPLAIN output.\n")
+                  (let ((parts nil)
+                        (seen (make-hash-table :test 'equal)))
+                    (dolist (tbl-name table-names)
+                      (let ((real-ddl (isqlm--genddl-fetch-create-table tbl-name))
+                            (real-name tbl-name))
+                        ;; If SHOW CREATE TABLE fails, it might be an alias
+                        (unless real-ddl
+                          (let ((resolved (isqlm--genddl-resolve-alias tbl-name clean-sql)))
+                            (when resolved
+                              (setq real-name resolved)
+                              (setq real-ddl (isqlm--genddl-fetch-create-table resolved)))))
+                        ;; Skip duplicates (e.g. alias resolved to same table)
+                        (unless (gethash real-name seen)
+                          (puthash real-name t seen)
+                          (if real-ddl
+                              (let ((col-types (isqlm--genddl-parse-columns-from-ddl real-ddl)))
+                                (push (concat real-ddl ";\n") parts)
+                                (when col-types
+                                  (let ((dml (isqlm--genddl-fetch-data real-name col-types)))
+                                    (when dml (push dml parts)))))
+                            (push (format "-- Table `%s`: not found\n" tbl-name) parts)))))
+                    (isqlm--output-info
+                     (mapconcat #'identity (nreverse parts) "\n")))))
+            (error
+             (isqlm--output-error
+              (concat "EXPLAIN failed: " (isqlm--error-message err) "\n")))))))))
+
 ;; Define the isqlm/ entry points for the command dispatcher
 (defun isqlm/d (&rest args)
   "Describe tables/views (psql-style).  See \\help for details."

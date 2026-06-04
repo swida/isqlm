@@ -470,4 +470,70 @@ Regression test: :varname was not expanded before eval."
     (should (equal (isqlm--strip-terminator "SELECT 1//")
                    '("SELECT 1" . nil)))))
 
+;; ============================================================
+;; Generate DDL/DML
+;; ============================================================
+
+(ert-deftest isqlm-test-genddl-extract-tables-from-json ()
+  "Test table name extraction from EXPLAIN FORMAT=JSON output."
+  ;; Simple single table
+  (should (equal (isqlm--genddl-extract-tables-from-json
+                  "{\"table_name\": \"t1\"}")
+                 '("t1")))
+  ;; Multiple tables (JOIN)
+  (let ((tables (isqlm--genddl-extract-tables-from-json
+                 "{\"table_name\": \"t1\"}, {\"table_name\": \"t2\"}")))
+    (should (= (length tables) 2))
+    (should (member "t1" tables))
+    (should (member "t2" tables)))
+  ;; Skip derived tables
+  (should (equal (isqlm--genddl-extract-tables-from-json
+                  "{\"table_name\": \"<derived2>\"}, {\"table_name\": \"t1\"}")
+                 '("t1")))
+  ;; Deduplication
+  (should (equal (isqlm--genddl-extract-tables-from-json
+                  "{\"table_name\": \"t1\"}, {\"table_name\": \"t1\"}")
+                 '("t1"))))
+
+(ert-deftest isqlm-test-genddl-resolve-alias ()
+  "Test alias resolution from SQL text."
+  ;; Explicit AS
+  (should (equal (isqlm--genddl-resolve-alias "t" "select * from t1 as t")
+                 "t1"))
+  (should (equal (isqlm--genddl-resolve-alias "t" "select * from t1 AS t;")
+                 "t1"))
+  ;; Implicit alias (no AS)
+  (should (equal (isqlm--genddl-resolve-alias "a" "select * from users a")
+                 "users"))
+  ;; Backtick-quoted table
+  (should (equal (isqlm--genddl-resolve-alias "t" "select * from `my_table` t")
+                 "my_table"))
+  ;; Not found
+  (should-not (isqlm--genddl-resolve-alias "x" "select * from t1"))
+  ;; Should not match keywords
+  (should-not (isqlm--genddl-resolve-alias "t1" "select * from t1")))
+
+(ert-deftest isqlm-test-genddl-parse-columns-from-ddl ()
+  "Test parsing columns from a real CREATE TABLE DDL."
+  (let* ((ddl "CREATE TABLE `t3` (\n  `a` int DEFAULT NULL,\n  `b` int DEFAULT NULL,\n  `c` int DEFAULT NULL,\n  KEY `a` (`a`,`b`)\n) ENGINE=InnoDB")
+         (cols (isqlm--genddl-parse-columns-from-ddl ddl)))
+    (should (= (length cols) 3))
+    (should (equal (car (nth 0 cols)) "a"))
+    (should (equal (cdr (nth 0 cols)) "int"))
+    (should (equal (car (nth 1 cols)) "b"))
+    (should (equal (car (nth 2 cols)) "c"))))
+
+(ert-deftest isqlm-test-genddl-format-value ()
+  "Test value formatting respects column types."
+  ;; int columns: no quotes
+  (should (equal (isqlm--genddl-format-value "42" "int") "42"))
+  (should (equal (isqlm--genddl-format-value "0" "bigint") "0"))
+  (should (equal (isqlm--genddl-format-value "3.14" "decimal(10,2)") "3.14"))
+  ;; string columns: quoted
+  (should (equal (isqlm--genddl-format-value "hello" "varchar(255)") "'hello'"))
+  (should (equal (isqlm--genddl-format-value "it's" "varchar(255)") "'it''s'"))
+  ;; NULL
+  (should (equal (isqlm--genddl-format-value nil "int") "NULL"))
+  (should (equal (isqlm--genddl-format-value nil "varchar(50)") "NULL")))
+
 ;;; isqlm-test.el ends here
