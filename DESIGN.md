@@ -186,6 +186,7 @@ This expansion happens after statement splitting and before `isqlm--execute-sql`
 | `\linestyle` | `isqlm/linestyle` | Set/cycle line-drawing style (ascii/unicode/none) |
 | `\timing` | `isqlm/timing` | Toggle/set query execution timing display |
 | `\delimiter` / `DELIMITER` | `isqlm/delimiter` | Set statement delimiter for stored programs |
+| `\l[x+]` / `\list[x+]` | `isqlm/l` etc. | List databases (x=expanded, +=detail with sizes) |
 | `\d` | `isqlm/d` | List tables/views or describe a table |
 | `\d+` | `isqlm/d+` | Same with extra detail (engine, size, CREATE TABLE, partition info) |
 | `\dt` / `\dv` / `\di` | `isqlm/dt` etc. | List tables / views / indexes |
@@ -267,7 +268,74 @@ Inspired by PostgreSQL's `psql` meta-commands. Uses a stack-based approach:
 
 **Inline parsing**: the body string between `{` and `}` is split on `;`. Non-command lines without terminators get `;` auto-appended.
 
-## 4.3 Listing Functions/Procedures (`\df`)
+## 4.3 Listing Databases (`\l` / `\list`)
+
+Inspired by PostgreSQL's `\l` meta-command. Lists databases in the server from `INFORMATION_SCHEMA.SCHEMATA`.
+
+**Syntax**: `\l[x][+] [PATTERN]` or `\list[x][+] [PATTERN]`
+
+**Modifier letters** (parsed by `isqlm--l-parse-modifiers`):
+
+| Letter | Meaning |
+|--------|---------|
+| `x` | Expanded display (vertical mode, one field per line) |
+| `+` | Verbose mode — show additional columns (size, tablespace) |
+
+**Output columns**:
+
+| Mode | Columns |
+|------|---------|
+| Normal | Name, Encoding, Collation, Access privileges |
+| Verbose (`+`) | Name, Encoding, Collation, Size, Tablespace, Access privileges |
+
+**Pattern filtering**: If PATTERN is specified, only databases whose names match are listed. Wildcards: `*` → `%`, `?` → `_` (SQL LIKE pattern).
+
+**Expanded mode** (`x`): Results are displayed in vertical format (one field per line, like `\G`), useful for wide output.
+
+**MySQL adaptation notes**:
+- PostgreSQL's "Owner" maps loosely to MySQL's grant system — we show `GRANTEE` from `INFORMATION_SCHEMA.SCHEMA_PRIVILEGES` as access privileges
+- "Encoding" shows `DEFAULT_CHARACTER_SET_NAME`
+- "Collation" shows `DEFAULT_COLLATION_NAME`
+- "Size" (verbose mode) is computed as `SUM(DATA_LENGTH + INDEX_LENGTH)` from `INFORMATION_SCHEMA.TABLES` for all tables in that schema
+- "Tablespace" is shown as empty (MySQL does not have per-database default tablespaces like PostgreSQL)
+
+**Implementation**:
+
+| Function | Description |
+|----------|-------------|
+| `isqlm--l-parse-modifiers` | Parse modifier letters from command name (e.g. `"lx+"` → `(:expanded t :verbose t)`) |
+| `isqlm--l-dispatch` | Build and execute the `INFORMATION_SCHEMA.SCHEMATA` query with appropriate columns and WHERE clause |
+| `isqlm/l`, `isqlm/lx`, `isqlm/l+`, `isqlm/lx+` | Entry points for `\l` variants |
+| `isqlm/list`, `isqlm/listx`, `isqlm/list+`, `isqlm/listx+` | Entry points for `\list` variants |
+
+**Examples**:
+
+```
+SQL> \l
+┌────────────────────┬──────────┬────────────────────┬───────────────────┐
+│ Name               │ Encoding │ Collation          │ Access privileges │
+├────────────────────┼──────────┼────────────────────┼───────────────────┤
+│ information_schema │ utf8mb3  │ utf8mb3_general_ci │                   │
+│ mydb               │ utf8mb4  │ utf8mb4_0900_ai_ci │                   │
+│ test               │ utf8mb4  │ utf8mb4_0900_ai_ci │                   │
+└────────────────────┴──────────┴────────────────────┴───────────────────┘
+
+SQL> \l+ my*
+┌──────┬──────────┬────────────────────┬─────────┬────────────┬───────────────────┐
+│ Name │ Encoding │ Collation          │ Size    │ Tablespace │ Access privileges │
+├──────┼──────────┼────────────────────┼─────────┼────────────┼───────────────────┤
+│ mydb │ utf8mb4  │ utf8mb4_0900_ai_ci │ 1.25 MB │            │                   │
+└──────┴──────────┴────────────────────┴─────────┴────────────┴───────────────────┘
+
+SQL> \lx test
+*************************** 1. row ***************************
+              Name: test
+          Encoding: utf8mb4
+         Collation: utf8mb4_0900_ai_ci
+ Access privileges:
+```
+
+## 4.4 Listing Functions/Procedures (`\df`)
 
 Inspired by PostgreSQL's `\df` meta-command. Lists stored functions and procedures from `INFORMATION_SCHEMA.ROUTINES`.
 
@@ -357,7 +425,7 @@ Inspired by PostgreSQL's `\ef`. Fetches a stored function/procedure definition a
 
 **Command dispatch note**: `\ef` receives the raw rest of the line (not tokenized), same as `\eval`. This allows function names with parentheses like `foo(integer, text)` to be passed intact.
 
-## 4.5 Generate DDL/DML from SQL (`\genddl`)
+## 4.6 Generate DDL/DML from SQL (`\genddl`)
 
 Generates `CREATE TABLE` and `INSERT INTO` statements for all tables referenced in a SQL query. Useful for creating minimal reproducible test cases.
 
@@ -385,7 +453,7 @@ INSERT INTO `t3` (`a`, `b`, `c`) VALUES
 
 **How it works**:
 
-1. **Table extraction via EXPLAIN** (`isqlm--genddl-extract-tables-via-explain`): Runs `EXPLAIN <sql>` and collects unique table names from the `table` column. This leverages MySQL's own SQL parser, correctly handling subqueries, CTEs, hints, aliases, comma-separated FROM lists, etc. Derived tables (`<derived2>`, `<subquery1>`) are filtered out. If EXPLAIN fails (syntax error, missing table, etc.), the error is reported directly.
+1. **Table extraction via SQL parsing** (`isqlm--genddl-extract-tables-from-sql`): Parses the SQL text directly, extracting table names that follow `FROM`, `JOIN`, `UPDATE`, `INTO`, `STRAIGHT_JOIN` keywords. Handles backtick-quoted names, `schema.table` notation, implicit/explicit aliases (which are skipped), comma-separated table lists, and subqueries (balanced parenthesis skipping). This avoids the EXPLAIN approach where MySQL reports aliases instead of physical table names.
 
 2. **Real DDL fetch** (`isqlm--genddl-fetch-create-table`): Issues `SHOW CREATE TABLE` for each table. Uses the real DDL verbatim.
 
@@ -397,8 +465,8 @@ INSERT INTO `t3` (`a`, `b`, `c`) VALUES
 
 | Function | Description |
 |----------|-------------|
-| `isqlm/genddl` | Entry point: require connection, EXPLAIN, fetch DDL+data, output |
-| `isqlm--genddl-extract-tables-via-explain` | Extract table names using `EXPLAIN` |
+| `isqlm/genddl` | Entry point: require connection, parse SQL, fetch DDL+data, output |
+| `isqlm--genddl-extract-tables-from-sql` | Extract table names by parsing SQL text |
 | `isqlm--genddl-fetch-create-table` | Fetch real DDL via `SHOW CREATE TABLE` |
 | `isqlm--genddl-parse-columns-from-ddl` | Parse column name/type from DDL string |
 | `isqlm--genddl-fetch-data` | Fetch real rows via `SELECT ... LIMIT` for DML |

@@ -1953,6 +1953,116 @@ Press C-c C-c to execute, C-c C-k to abort."
       (isqlm--output (apply #'concat (nreverse lines))))))
 
 ;; ============================================================
+;; \l / \list — list databases (psql-inspired)
+;; ============================================================
+
+(defun isqlm--l-parse-modifiers (raw-cmd)
+  "Parse RAW-CMD (e.g. \"l\", \"l+\", \"lx\", \"lx+\", \"list\", \"listx+\") into modifiers.
+Returns a plist (:expanded BOOL :verbose BOOL)."
+  (let* ((suffix (cond
+                  ((string-prefix-p "list" raw-cmd) (substring raw-cmd 4))
+                  ((string-prefix-p "l" raw-cmd) (substring raw-cmd 1))
+                  (t "")))
+         (expanded nil)
+         (verbose nil))
+    (dolist (ch (string-to-list suffix))
+      (pcase ch
+        (?x (setq expanded t))
+        (?+ (setq verbose t))))
+    (list :expanded expanded :verbose verbose)))
+
+(defun isqlm--l-dispatch (raw-cmd args)
+  "Dispatch a \\l-family command.
+RAW-CMD is the command name without \\, ARGS is the argument list."
+  (if (not (isqlm--connected-p))
+      (isqlm--output-error "Not connected.\n")
+    (setq isqlm--suppress-summary t)
+    (let* ((mods (isqlm--l-parse-modifiers raw-cmd))
+           (expanded (plist-get mods :expanded))
+           (verbose (plist-get mods :verbose))
+           (pattern (car args))
+           ;; Build WHERE clause for pattern filtering
+           (where (if pattern
+                      (format " WHERE SCHEMA_NAME LIKE '%s'"
+                              (replace-regexp-in-string
+                               "\\*" "%" (replace-regexp-in-string
+                                          "?" "_" pattern)))
+                    ""))
+           ;; Build SQL
+           (sql (if verbose
+                    ;; \l+ — include sizes, default tablespace (N/A in MySQL), description
+                    (concat
+                     "SELECT s.SCHEMA_NAME AS `Name`,"
+                     " IFNULL(s.DEFAULT_CHARACTER_SET_NAME, '') AS `Encoding`,"
+                     " IFNULL(s.DEFAULT_COLLATION_NAME, '') AS `Collation`,"
+                     " IFNULL((SELECT CONCAT(ROUND(SUM(DATA_LENGTH + INDEX_LENGTH)"
+                     " / 1024 / 1024, 2), ' MB')"
+                     " FROM INFORMATION_SCHEMA.TABLES t"
+                     " WHERE t.TABLE_SCHEMA = s.SCHEMA_NAME), '') AS `Size`,"
+                     " '' AS `Tablespace`,"
+                     " IFNULL((SELECT DISTINCT GRANTEE"
+                     " FROM INFORMATION_SCHEMA.SCHEMA_PRIVILEGES sp"
+                     " WHERE sp.TABLE_SCHEMA = s.SCHEMA_NAME"
+                     " LIMIT 1), '') AS `Access privileges`"
+                     " FROM INFORMATION_SCHEMA.SCHEMATA s"
+                     where
+                     " ORDER BY s.SCHEMA_NAME")
+                  ;; \l — basic: name, owner (definer), encoding, access privileges
+                  (concat
+                   "SELECT s.SCHEMA_NAME AS `Name`,"
+                   " IFNULL(s.DEFAULT_CHARACTER_SET_NAME, '') AS `Encoding`,"
+                   " IFNULL(s.DEFAULT_COLLATION_NAME, '') AS `Collation`,"
+                   " IFNULL((SELECT DISTINCT GRANTEE"
+                   " FROM INFORMATION_SCHEMA.SCHEMA_PRIVILEGES sp"
+                   " WHERE sp.TABLE_SCHEMA = s.SCHEMA_NAME"
+                   " LIMIT 1), '') AS `Access privileges`"
+                   " FROM INFORMATION_SCHEMA.SCHEMATA s"
+                   where
+                   " ORDER BY s.SCHEMA_NAME"))))
+      ;; Execute with expanded (vertical) mode if x modifier
+      (if expanded
+          ;; Use vertical display by appending \G
+          (isqlm--quick-sql (concat sql "\\G") t)
+        (isqlm--quick-sql (concat sql ";") t)))))
+
+;; Define the isqlm/ entry points for \l commands
+(defun isqlm/l (&rest args)
+  "List databases (psql-style).
+\\l[x][+] [PATTERN]
+  x = expanded display (vertical)
+  + = extra detail (size, tablespace)
+  PATTERN filters by name (* = %, ? = _)."
+  (isqlm--l-dispatch "l" args))
+
+(defun isqlm/lx (&rest args)
+  "List databases in expanded mode."
+  (isqlm--l-dispatch "lx" args))
+
+(defun isqlm/l+ (&rest args)
+  "List databases with extra detail (size, tablespace)."
+  (isqlm--l-dispatch "l+" args))
+
+(defun isqlm/lx+ (&rest args)
+  "List databases in expanded mode with extra detail."
+  (isqlm--l-dispatch "lx+" args))
+
+(defun isqlm/list (&rest args)
+  "List databases (psql-style).  Same as \\l."
+  (isqlm--l-dispatch "list" args))
+
+(defun isqlm/listx (&rest args)
+  "List databases in expanded mode.  Same as \\lx."
+  (isqlm--l-dispatch "listx" args))
+
+(defun isqlm/list+ (&rest args)
+  "List databases with extra detail.  Same as \\l+."
+  (isqlm--l-dispatch "list+" args))
+
+(defun isqlm/listx+ (&rest args)
+  "List databases in expanded mode with extra detail.  Same as \\lx+."
+  (isqlm--l-dispatch "listx+" args))
+
+;; ============================================================
 ;; \d family — describe database objects (psql-inspired)
 ;; ============================================================
 
@@ -2642,51 +2752,79 @@ If LINE-NUMBER is non-nil, position cursor on that line."
 ;; Generate DDL/DML from SQL (\genddl)
 ;; ============================================================
 
-(defun isqlm--genddl-extract-tables-from-json (json-str)
-  "Extract real table names from EXPLAIN FORMAT=JSON output string.
-Scans for \"table_name\": \"...\" entries, skipping derived/subquery markers."
+(defun isqlm--genddl-extract-tables-from-sql (sql)
+  "Extract physical table names from SQL text by parsing.
+Looks for table references after FROM, JOIN, UPDATE, INTO keywords.
+Handles: backtick-quoted names, schema.table, aliases (skipped),
+subqueries (balanced paren skipping), comma-separated table lists.
+Returns a deduplicated list of table name strings."
   (let ((tables nil)
-        (pos 0))
-    (while (string-match "\"table_name\"[ \t\n]*:[ \t\n]*\"\\([^\"]+\\)\"" json-str pos)
-      (let ((tbl (match-string 1 json-str)))
-        (unless (or (string-match-p "\\`<" tbl)
-                    (member tbl tables))
-          (push tbl tables)))
-      (setq pos (match-end 0)))
+        (case-fold-search t)
+        (pos 0)
+        (table-kw-re (concat "\\<\\(FROM\\|JOIN\\|UPDATE\\|INTO"
+                             "\\|STRAIGHT_JOIN\\)\\>"))
+        (tbl-re (concat "\\`[ \t\n]*"
+                        "`?\\([a-zA-Z_][a-zA-Z0-9_]*\\)`?"
+                        "\\(?:\\.`?\\([a-zA-Z_][a-zA-Z0-9_]*\\)`?\\)?"))
+        (alias-re "\\`[ \t\n]+\\(?:[Aa][Ss][ \t\n]+\\)?`?\\([a-zA-Z_][a-zA-Z0-9_]*\\)`?")
+        (comma-re "\\`[ \t\n]*,[ \t\n]*")
+        (subq-alias-re "\\`[ \t\n]+\\(?:[Aa][Ss][ \t\n]+\\)?`?[a-zA-Z_][a-zA-Z0-9_]*`?"))
+    (while (string-match table-kw-re sql pos)
+      (setq pos (match-end 0))
+      (let ((continue t))
+        (while continue
+          (let ((rest (substring sql pos)))
+            (cond
+             ;; Subquery: recurse into content, then skip balanced parens
+             ((string-match "\\`[ \t\n]*(" rest)
+              (let* ((open-offset (match-end 0))
+                     (depth 1)
+                     (p (+ pos open-offset)))
+                (while (and (< p (length sql)) (> depth 0))
+                  (cond
+                   ((= (aref sql p) ?\() (cl-incf depth))
+                   ((= (aref sql p) ?\)) (cl-decf depth)))
+                  (cl-incf p))
+                ;; Recurse: extract tables from the subquery content
+                (let ((inner (substring sql (+ pos open-offset) (max (+ pos open-offset) (1- p)))))
+                  (dolist (tbl (isqlm--genddl-extract-tables-from-sql inner))
+                    (unless (member tbl tables)
+                      (push tbl tables))))
+                (setq pos p)
+                (let ((after (substring sql pos)))
+                  (when (string-match subq-alias-re after)
+                    (setq pos (+ pos (match-end 0)))))))
+             ;; Table name
+             ((string-match tbl-re rest)
+              (let* ((part1 (match-string 1 rest))
+                     (part2 (match-string 2 rest))
+                     (tbl-name (or part2 part1)))
+                (setq pos (+ pos (match-end 0)))
+                (let ((after (substring sql pos)))
+                  (when (string-match alias-re after)
+                    (let ((maybe-alias (match-string 1 after)))
+                      (unless (member (downcase maybe-alias)
+                                      '("from" "join" "inner" "left" "right"
+                                        "outer" "cross" "natural" "straight_join"
+                                        "select" "where" "on" "using" "into"
+                                        "update" "table" "set" "values" "group"
+                                        "order" "having" "limit" "union" "except"
+                                        "intersect" "for" "lock" "window"
+                                        "partition"))
+                        (setq pos (+ pos (match-end 0)))))))
+                (unless (member (downcase tbl-name)
+                                '("select" "set" "dual"))
+                  (unless (member tbl-name tables)
+                    (push tbl-name tables)))))
+             ;; Nothing matched
+             (t (setq continue nil))))
+          ;; Check for comma to continue list
+          (when continue
+            (let ((rest (substring sql pos)))
+              (if (string-match comma-re rest)
+                  (setq pos (+ pos (match-end 0)))
+                (setq continue nil)))))))
     (nreverse tables)))
-
-(defun isqlm--genddl-extract-tables-via-explain (sql)
-  "Extract real table names from SQL using EXPLAIN FORMAT=JSON.
-Returns a list of unique table name strings.
-Signals an error if EXPLAIN fails (e.g. syntax error, missing table)."
-  (let* ((explain-sql (format "EXPLAIN FORMAT=JSON %s" sql))
-         (result (isqlm-execute-string explain-sql))
-         (rows (plist-get result :rows)))
-    ;; EXPLAIN FORMAT=JSON returns a single row with a single column (the JSON)
-    (when (and rows (car rows) (car (car rows)))
-      (isqlm--genddl-extract-tables-from-json (car (car rows))))))
-
-(defun isqlm--genddl-resolve-alias (alias sql)
-  "Resolve ALIAS to a real table name by searching SQL text.
-Looks for patterns like `table AS alias' or `table alias' in FROM/JOIN clauses.
-Returns the real table name, or nil if not found."
-  (let ((case-fold-search t)
-        (alias-re (regexp-quote alias)))
-    ;; Match: table_name AS alias  or  table_name alias
-    (when (string-match
-           (concat "`?\\([a-zA-Z_][a-zA-Z0-9_]*\\)`?"
-                   "[ \t\n]+\\(?:[Aa][Ss][ \t\n]+\\)?"
-                   "`?" alias-re "`?"
-                   "\\(?:[ \t\n,;)]\\|\\'\\)")
-           sql)
-      (let ((candidate (match-string 1 sql)))
-        ;; Make sure the candidate is not a keyword
-        (unless (member (downcase candidate)
-                        '("from" "join" "inner" "left" "right" "outer"
-                          "cross" "natural" "straight_join" "select"
-                          "where" "on" "using" "into" "update" "table"
-                          "as" "set" "values"))
-          candidate)))))
 
 (defun isqlm--genddl-fetch-create-table (tbl-name)
   "Fetch the CREATE TABLE statement for TBL-NAME from the server.
@@ -2770,8 +2908,8 @@ Returns the INSERT statement string, or nil if the table is empty."
 Usage: \\genddl SQL-STATEMENT
 If no argument, uses the last executed SQL query.
 
-Requires a live database connection.  Uses EXPLAIN to extract table names,
-SHOW CREATE TABLE for DDL, and SELECT for sample data.
+Requires a live database connection.  Parses SQL text to extract table names,
+then uses SHOW CREATE TABLE for DDL and SELECT for sample data.
 
 Example:
   \\genddl select t1.a, t2.b from t1 join t2 on t1.id = t2.t1_id
@@ -2788,39 +2926,27 @@ Produces DDL+DML for t1 and t2."
         (isqlm--output-error "Not connected.  \\genddl requires a database connection.\n")
         (setq sql nil))
       (when sql
-        ;; Strip trailing ; or \G for EXPLAIN compatibility
-        (let ((clean-sql (replace-regexp-in-string
-                          "\\(?:;\\|\\\\[Gg]\\)[ \t]*\\'" "" sql)))
-          (condition-case err
-              (let ((table-names (isqlm--genddl-extract-tables-via-explain clean-sql)))
-                (if (null table-names)
-                    (isqlm--output-error "No tables found in EXPLAIN output.\n")
-                  (let ((parts nil)
-                        (seen (make-hash-table :test 'equal)))
-                    (dolist (tbl-name table-names)
-                      (let ((real-ddl (isqlm--genddl-fetch-create-table tbl-name))
-                            (real-name tbl-name))
-                        ;; If SHOW CREATE TABLE fails, it might be an alias
-                        (unless real-ddl
-                          (let ((resolved (isqlm--genddl-resolve-alias tbl-name clean-sql)))
-                            (when resolved
-                              (setq real-name resolved)
-                              (setq real-ddl (isqlm--genddl-fetch-create-table resolved)))))
-                        ;; Skip duplicates (e.g. alias resolved to same table)
-                        (unless (gethash real-name seen)
-                          (puthash real-name t seen)
-                          (if real-ddl
-                              (let ((col-types (isqlm--genddl-parse-columns-from-ddl real-ddl)))
-                                (push (concat real-ddl ";\n") parts)
-                                (when col-types
-                                  (let ((dml (isqlm--genddl-fetch-data real-name col-types)))
-                                    (when dml (push dml parts)))))
-                            (push (format "-- Table `%s`: not found\n" tbl-name) parts)))))
-                    (isqlm--output-info
-                     (mapconcat #'identity (nreverse parts) "\n")))))
-            (error
-             (isqlm--output-error
-              (concat "EXPLAIN failed: " (isqlm--error-message err) "\n")))))))))
+        ;; Strip trailing ; or \G
+        (let* ((clean-sql (replace-regexp-in-string
+                           "\\(?:;\\|\\\\[Gg]\\)[ \t]*\\'" "" sql))
+               (table-names (isqlm--genddl-extract-tables-from-sql clean-sql)))
+          (if (null table-names)
+              (isqlm--output-error "No tables found in SQL.\n")
+            (let ((parts nil)
+                  (seen (make-hash-table :test 'equal)))
+              (dolist (tbl-name table-names)
+                (unless (gethash tbl-name seen)
+                  (puthash tbl-name t seen)
+                  (let ((real-ddl (isqlm--genddl-fetch-create-table tbl-name)))
+                    (if real-ddl
+                        (let ((col-types (isqlm--genddl-parse-columns-from-ddl real-ddl)))
+                          (push (concat real-ddl ";\n") parts)
+                          (when col-types
+                            (let ((dml (isqlm--genddl-fetch-data tbl-name col-types)))
+                              (when dml (push dml parts)))))
+                      (push (format "-- Table `%s`: not found\n" tbl-name) parts)))))
+              (isqlm--output-info
+               (mapconcat #'identity (nreverse parts) "\n")))))))))
 
 ;; Define the isqlm/ entry points for the command dispatcher
 (defun isqlm/d (&rest args)

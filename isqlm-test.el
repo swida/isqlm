@@ -474,44 +474,57 @@ Regression test: :varname was not expanded before eval."
 ;; Generate DDL/DML
 ;; ============================================================
 
-(ert-deftest isqlm-test-genddl-extract-tables-from-json ()
-  "Test table name extraction from EXPLAIN FORMAT=JSON output."
+(ert-deftest isqlm-test-genddl-extract-tables-from-sql ()
+  "Test table name extraction from SQL text."
   ;; Simple single table
-  (should (equal (isqlm--genddl-extract-tables-from-json
-                  "{\"table_name\": \"t1\"}")
+  (should (equal (isqlm--genddl-extract-tables-from-sql "SELECT * FROM t1")
                  '("t1")))
-  ;; Multiple tables (JOIN)
-  (let ((tables (isqlm--genddl-extract-tables-from-json
-                 "{\"table_name\": \"t1\"}, {\"table_name\": \"t2\"}")))
+  ;; Table with alias (AS)
+  (should (equal (isqlm--genddl-extract-tables-from-sql "SELECT * FROM users AS u")
+                 '("users")))
+  ;; Table with implicit alias
+  (should (equal (isqlm--genddl-extract-tables-from-sql "SELECT * FROM users u")
+                 '("users")))
+  ;; Multiple tables via JOIN
+  (let ((tables (isqlm--genddl-extract-tables-from-sql
+                 "SELECT * FROM t1 a JOIN t2 b ON a.id = b.t1_id")))
     (should (= (length tables) 2))
     (should (member "t1" tables))
     (should (member "t2" tables)))
-  ;; Skip derived tables
-  (should (equal (isqlm--genddl-extract-tables-from-json
-                  "{\"table_name\": \"<derived2>\"}, {\"table_name\": \"t1\"}")
-                 '("t1")))
-  ;; Deduplication
-  (should (equal (isqlm--genddl-extract-tables-from-json
-                  "{\"table_name\": \"t1\"}, {\"table_name\": \"t1\"}")
-                 '("t1"))))
-
-(ert-deftest isqlm-test-genddl-resolve-alias ()
-  "Test alias resolution from SQL text."
-  ;; Explicit AS
-  (should (equal (isqlm--genddl-resolve-alias "t" "select * from t1 as t")
-                 "t1"))
-  (should (equal (isqlm--genddl-resolve-alias "t" "select * from t1 AS t;")
-                 "t1"))
-  ;; Implicit alias (no AS)
-  (should (equal (isqlm--genddl-resolve-alias "a" "select * from users a")
-                 "users"))
+  ;; Comma-separated FROM list
+  (let ((tables (isqlm--genddl-extract-tables-from-sql
+                 "SELECT * FROM t1, t2, t3 WHERE t1.id = t2.id")))
+    (should (= (length tables) 3))
+    (should (member "t1" tables))
+    (should (member "t2" tables))
+    (should (member "t3" tables)))
   ;; Backtick-quoted table
-  (should (equal (isqlm--genddl-resolve-alias "t" "select * from `my_table` t")
-                 "my_table"))
-  ;; Not found
-  (should-not (isqlm--genddl-resolve-alias "x" "select * from t1"))
-  ;; Should not match keywords
-  (should-not (isqlm--genddl-resolve-alias "t1" "select * from t1")))
+  (should (equal (isqlm--genddl-extract-tables-from-sql "SELECT * FROM `my_table`")
+                 '("my_table")))
+  ;; Schema-qualified table
+  (should (equal (isqlm--genddl-extract-tables-from-sql "SELECT * FROM mydb.users u")
+                 '("users")))
+  ;; Subquery should not produce false table names
+  (should (equal (isqlm--genddl-extract-tables-from-sql
+                 "SELECT * FROM (SELECT * FROM t1) sub JOIN t2 ON sub.id = t2.id")
+                 '("t1" "t2")))
+  ;; UPDATE statement
+  (should (equal (isqlm--genddl-extract-tables-from-sql "UPDATE orders SET status = 1")
+                 '("orders")))
+  ;; INSERT INTO
+  (should (equal (isqlm--genddl-extract-tables-from-sql "INSERT INTO logs VALUES (1, 'x')")
+                 '("logs")))
+  ;; LEFT JOIN, RIGHT JOIN
+  (let ((tables (isqlm--genddl-extract-tables-from-sql
+                 "SELECT * FROM t1 LEFT JOIN t2 ON t1.a = t2.a RIGHT JOIN t3 ON t2.b = t3.b")))
+    (should (= (length tables) 3))
+    (should (member "t1" tables))
+    (should (member "t2" tables))
+    (should (member "t3" tables)))
+  ;; Deduplication
+  (should (equal (isqlm--genddl-extract-tables-from-sql
+                 "SELECT * FROM t1 JOIN t1 ON t1.a = t1.b")
+                 '("t1"))))
 
 (ert-deftest isqlm-test-genddl-parse-columns-from-ddl ()
   "Test parsing columns from a real CREATE TABLE DDL."
