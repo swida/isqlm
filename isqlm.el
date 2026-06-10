@@ -3456,9 +3456,10 @@ Otherwise, insert a continuation prompt for multi-line input."
   (if isqlm--async-busy
       (message "Query in progress... (C-c C-c to cancel)")
   ;; Normal input handling
-  (progn
+  (catch 'done
   ;; If point is before the current input area, grab the line and
-  ;; copy it to the input area, then execute from there.
+  ;; copy it to the input area for editing (Eshell-style).
+  ;; The user can then edit and press RET again to execute.
   (when (< (point) (marker-position isqlm-last-output-end))
     (let ((line (string-trim (buffer-substring-no-properties
                               (line-beginning-position)
@@ -3470,9 +3471,10 @@ Otherwise, insert a continuation prompt for multi-line input."
         (setq line (substring line (length isqlm-prompt-continue))))
       (setq line (string-trim line))
       (when (> (length line) 0)
-        ;; Replace current input with the grabbed line
+        ;; Replace current input with the grabbed line and let the user edit
         (isqlm--replace-current-input line)
-        (goto-char (point-max)))))
+        (goto-char (point-max))
+        (throw 'done nil))))
   ;; Now proceed with normal input handling
   (let ((isqlm-buf (current-buffer))
         (input (buffer-substring-no-properties

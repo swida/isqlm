@@ -96,7 +96,7 @@ User presses RET
 
 ### History Re-execution
 
-When the cursor is in the history area (before `isqlm-last-output-end`), pressing `RET` extracts the text of the current line, strips any prompt prefix (`SQL> ` or `  -> `), copies it to the current input area, and proceeds with normal execution. This mirrors Eshell and sql-mode behavior.
+When the cursor is in the history area (before `isqlm-last-output-end`), pressing `RET` extracts the text of the current line, strips any prompt prefix (`SQL> ` or `  -> `), and copies it to the current input area — but does **not** immediately execute. The user can then edit the copied text and press `RET` again to execute. This mirrors Eshell behavior: navigate up to a previous command, press `RET` to grab it into the editable input area, modify if needed, then `RET` to run.
 
 ### Multi-line Input
 
