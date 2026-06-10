@@ -18,10 +18,10 @@ through the [`mysql-el`](https://github.com/swida/mysql-el) dynamic module (C FF
 - **Conditional flow** — `\if`/`\elif`/`\else`/`\endif` with nesting support
 - **Multi-line SQL input** — press `M-RET` for literal newlines; `RET` submits
 - **Multi-line cell values** — newlines inside column values render correctly
-- **History re-execution** — move cursor to any previous input line and press `RET` to re-run it
+- **History re-execution** — previous input lines are editable; edit in place and press `RET` to execute
 - **Input interrupt** — `C-c C-c` aborts current (multi-line) input
 - **Send SQL from external buffers** — `isqlm-send-region`, `isqlm-send-paragraph`, etc.
-- **Ring-based input history** with file persistence (`M-p` / `M-n`)
+- **Ring-based input history** with file persistence (`M-p` / `M-n`) and search (`M-r`)
 - **SQL keyword font-locking**
 - **Auto-adaptive column widths** with visual line wrapping in the window
 - **Command aliases** — extensible shorthand mappings (`\?` = `\help`, etc.)
@@ -31,6 +31,7 @@ through the [`mysql-el`](https://github.com/swida/mysql-el) dynamic module (C FF
 - **Warning count display** — query results show warnings like `1 row in set, 2 warnings`
 - **Execution timing** — `\timing` toggles display of query execution time (milliseconds, with human-readable breakdown for long queries)
 - **psql-style `\d` commands** — `\d`, `\dt`, `\dv`, `\di`, `\d+` for listing and describing tables, views, and indexes; `\d+ TABLE` shows partition info for partitioned tables
+- **psql-style `\l` commands** — `\l`, `\l+`, `\lx`, `\list` for listing databases with encoding, collation, size, and access privileges
 - **psql-style `\df` commands** — `\df`, `\dfn`, `\dfp`, `\df+` for listing functions and procedures with optional argument-type filtering
 - **Custom delimiter** — `DELIMITER //` or `\delimiter //` for creating stored procedures, functions, and triggers
 
@@ -215,6 +216,7 @@ All built-in commands are prefixed with `\`:
 | `\dt [PATTERN]` | List tables (`\dt+` for detail) |
 | `\dv [PATTERN]` | List views (`\dv+` for detail) |
 | `\di [TABLE]` | List indexes (all or for TABLE) |
+| `\l[x][+] [PATTERN]` / `\list[x][+] [PATTERN]` | List databases (`x`=expanded, `+`=detail with sizes) |
 | `\df[np][S][+] [PATTERN [ARG_PATTERN ...]]` | List functions/procedures (`n`=functions, `p`=procedures, `S`=system, `+`=detail) |
 | `\ef [NAME[(types)]]` | Edit function/procedure definition (C-c C-c to execute, C-c C-k to discard) |
 | `\eval EXPRESSION` | Evaluate an Elisp expression |
@@ -423,7 +425,7 @@ A `*isqlm-script*` buffer opens with `sql-mode` syntax highlighting. Write your 
 
 | Key | Action |
 |-----|--------|
-| `RET` | Submit input; or re-execute line under cursor (in history area) |
+| `RET` | Submit input; in history area: edit previous input in place, then `RET` to execute |
 | `M-RET` | Insert literal newline (multi-line SQL) |
 | `C-c C-c` | Abort current input (interrupt) |
 | `C-c C-n` | Connect |
@@ -434,6 +436,7 @@ A `*isqlm-script*` buffer opens with `sql-mode` syntax highlighting. Write your 
 | `C-c C-t` | `SHOW TABLES` |
 | `C-c C-d` | `DESCRIBE TABLE` |
 | `M-p` / `M-n` | Navigate history |
+| `M-r` | Incremental regexp search through history |
 | `C-a` | Move to beginning of input (skip prompt) |
 
 ## Entry Points

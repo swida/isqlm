@@ -269,6 +269,7 @@ Returns e.g. \"Time: 42.531 ms\", \"Time: 1234.567 ms (1 s)\",
   "C-c C-d" #'isqlm-describe-table
   "M-p"     #'isqlm-previous-input
   "M-n"     #'isqlm-next-input
+  "M-r"     #'isqlm-history-search
   "C-a"     #'isqlm-bol)
 
 (easy-menu-define isqlm-menu isqlm-mode-map
@@ -558,6 +559,142 @@ Returns non-nil if reconnection succeeded."
        (t
         (setq isqlm-history-index nil)
         (isqlm--replace-current-input (or isqlm-input-saved "")))))))
+
+(defvar-local isqlm--history-isearch-index nil
+  "Current history index during isearch history navigation.")
+
+(defvar-local isqlm--history-isearch-message-overlay nil
+  "Overlay used to display isearch message over the prompt.")
+
+(defvar-local isqlm--force-history-isearch nil
+  "Non-nil when M-r forces isearch into history mode.")
+
+(defun isqlm-history-search ()
+  "Incrementally search backward through history commands (like Eshell M-r).
+Uses Emacs isearch framework with custom search function that
+traverses the history ring, displaying matches on the command line."
+  (interactive)
+  (unless (and isqlm-history-ring (not (ring-empty-p isqlm-history-ring)))
+    (user-error "History is empty"))
+  (setq isqlm--force-history-isearch t)
+  (isearch-backward-regexp nil t))
+
+(defun isqlm--history-isearch-setup ()
+  "Set up isearch to search through history when in isqlm-mode.
+Called from `isearch-mode-hook'."
+  (when (and (derived-mode-p 'isqlm-mode)
+             isqlm--force-history-isearch
+             isqlm-history-ring
+             (not (ring-empty-p isqlm-history-ring)))
+    (setq isearch-message-prefix-add "history ")
+    (setq-local isearch-search-fun-function #'isqlm--history-isearch-search
+                isearch-message-function #'isqlm--history-isearch-message
+                isearch-wrap-function #'isqlm--history-isearch-wrap
+                isearch-push-state-function #'isqlm--history-isearch-push-state)
+    (add-hook 'isearch-mode-end-hook #'isqlm--history-isearch-end nil t)))
+
+(defun isqlm--history-isearch-end ()
+  "Clean up after history isearch ends."
+  (setq isqlm--force-history-isearch nil)
+  (setq isqlm--history-isearch-index nil)
+  (when (overlayp isqlm--history-isearch-message-overlay)
+    (delete-overlay isqlm--history-isearch-message-overlay))
+  (setq isqlm--history-isearch-message-overlay nil)
+  (kill-local-variable 'isearch-search-fun-function)
+  (kill-local-variable 'isearch-message-function)
+  (kill-local-variable 'isearch-wrap-function)
+  (kill-local-variable 'isearch-push-state-function)
+  (remove-hook 'isearch-mode-end-hook #'isqlm--history-isearch-end t))
+
+(defun isqlm--history-goto (pos)
+  "Replace current input with history entry at POS.
+POS is an index into `isqlm-history-ring', or nil to restore."
+  (let ((inhibit-read-only t))
+    (delete-region isqlm-last-output-end (point-max))
+    (goto-char isqlm-last-output-end)
+    (when pos
+      (insert (ring-ref isqlm-history-ring pos))))
+  (setq isqlm--history-isearch-index pos))
+
+(defun isqlm--history-isearch-search ()
+  "Return the search function for history isearch."
+  (lambda (string bound noerror)
+    (let ((search-fun (isearch-search-fun-default))
+          found)
+      (or
+       ;; First: search within the current command line text
+       (funcall search-fun string
+                (if isearch-forward bound isqlm-last-output-end)
+                noerror)
+       ;; Second: traverse history ring
+       (unless bound
+         (condition-case nil
+             (progn
+               (while (not found)
+                 (cond
+                  (isearch-forward
+                   (when (or (null isqlm--history-isearch-index)
+                             (eq isqlm--history-isearch-index 0))
+                     (error "End of history"))
+                   (isqlm--history-goto
+                    (1- isqlm--history-isearch-index))
+                   (goto-char isqlm-last-output-end))
+                  (t
+                   (let ((next (if isqlm--history-isearch-index
+                                   (1+ isqlm--history-isearch-index)
+                                 0)))
+                     (when (>= next (ring-length isqlm-history-ring))
+                       (error "Beginning of history"))
+                     (isqlm--history-goto next)
+                     (goto-char (point-max)))))
+                 (setq isearch-barrier (point)
+                       isearch-opoint (point))
+                 (setq found (funcall search-fun string
+                                      (unless isearch-forward
+                                        isqlm-last-output-end)
+                                      noerror)))
+               (point))
+           (error nil)))))))
+
+(defun isqlm--history-isearch-message (&optional c-q-hack ellipsis)
+  "Display isearch message for history search."
+  (if (not (and isearch-success (not isearch-error)))
+      (isearch-message c-q-hack ellipsis)
+    ;; Show search prompt over the isqlm prompt using an overlay
+    (let ((msg (isearch-message-prefix ellipsis isearch-nonincremental)))
+      (if (overlayp isqlm--history-isearch-message-overlay)
+          (move-overlay isqlm--history-isearch-message-overlay
+                        (save-excursion
+                          (goto-char isqlm-last-output-end)
+                          (line-beginning-position))
+                        isqlm-last-output-end)
+        (setq isqlm--history-isearch-message-overlay
+              (make-overlay
+               (save-excursion
+                 (goto-char isqlm-last-output-end)
+                 (line-beginning-position))
+               isqlm-last-output-end))
+        (overlay-put isqlm--history-isearch-message-overlay 'evaporate t))
+      (overlay-put isqlm--history-isearch-message-overlay 'display msg)
+      (if (and isqlm--history-isearch-index (not ellipsis))
+          (message "History item: %d"
+                   (- (ring-length isqlm-history-ring)
+                      isqlm--history-isearch-index))
+        (message "")))))
+
+(defun isqlm--history-isearch-wrap ()
+  "Wrap around when history isearch hits the boundary."
+  (if isearch-forward
+      (isqlm--history-goto (1- (ring-length isqlm-history-ring)))
+    (isqlm--history-goto nil))
+  (goto-char (if isearch-forward isqlm-last-output-end (point-max))))
+
+(defun isqlm--history-isearch-push-state ()
+  "Save current history index for isearch state stack."
+  (let ((idx isqlm--history-isearch-index))
+    (lambda (_cmd)
+      (isqlm--history-goto idx))))
+
 
 (defun isqlm-bol ()
   "Move to beginning of input line, skipping prompt."
@@ -3456,25 +3593,26 @@ Otherwise, insert a continuation prompt for multi-line input."
   (if isqlm--async-busy
       (message "Query in progress... (C-c C-c to cancel)")
   ;; Normal input handling
-  (catch 'done
-  ;; If point is before the current input area, grab the line and
-  ;; copy it to the input area for editing (Eshell-style).
-  ;; The user can then edit and press RET again to execute.
+  (progn
+  ;; If point is before the current input area, grab the (possibly
+  ;; edited) input from this line and copy it to the input area, then
+  ;; execute.  Past input lines are not read-only, so the user can
+  ;; edit them in place before pressing RET — Eshell-style.
   (when (< (point) (marker-position isqlm-last-output-end))
-    (let ((line (string-trim (buffer-substring-no-properties
-                              (line-beginning-position)
-                              (line-end-position)))))
-      ;; Strip any prompt prefix that may be on the line
-      (when (string-prefix-p isqlm-prompt-internal line)
-        (setq line (substring line (length isqlm-prompt-internal))))
-      (when (string-prefix-p isqlm-prompt-continue line)
-        (setq line (substring line (length isqlm-prompt-continue))))
-      (setq line (string-trim line))
+    (let* ((bol (line-beginning-position))
+           (eol (line-end-position))
+           ;; Find the end of the prompt region on this line.
+           ;; Walk forward from bol past any field=prompt text.
+           (input-start
+            (if (eq (get-text-property bol 'field) 'prompt)
+                (next-single-property-change bol 'field nil eol)
+              bol))
+           (line (string-trim (buffer-substring-no-properties
+                               input-start eol))))
       (when (> (length line) 0)
-        ;; Replace current input with the grabbed line and let the user edit
+        ;; Place the line in the current input area and fall through
         (isqlm--replace-current-input line)
-        (goto-char (point-max))
-        (throw 'done nil))))
+        (goto-char (point-max)))))
   ;; Now proceed with normal input handling
   (let ((isqlm-buf (current-buffer))
         (input (buffer-substring-no-properties
@@ -3486,9 +3624,15 @@ Otherwise, insert a continuation prompt for multi-line input."
     (goto-char (point-max))
     (let ((inhibit-read-only t))
       (insert "\n")
-      ;; Make the submitted input read-only
-      (add-text-properties isqlm-last-input-start (point)
-                           '(read-only t rear-nonsticky t field input)))
+      ;; Mark the submitted input as field=input but NOT read-only,
+      ;; so the user can edit previous input lines in place (Eshell-style).
+      ;; rear-nonsticky only for read-only — field must remain sticky so
+      ;; newly inserted characters inherit field=input.
+      ;; The trailing newline IS read-only to prevent deletion across boundaries.
+      (add-text-properties isqlm-last-input-start (1- (point))
+                           '(rear-nonsticky (read-only) field input))
+      (add-text-properties (1- (point)) (point)
+                           '(read-only t rear-nonsticky (read-only) field input)))
     ;; Update output-end to current position
     (set-marker isqlm-last-output-end (point))
     ;; Reset history navigation
@@ -3636,12 +3780,14 @@ If an async query is in progress, cancel it."
     (isqlm--output-error "Query cancelled.\n"))
   ;; Discard any pending multi-line input
   (setq isqlm-pending-input "")
-  ;; Make the current input line read-only so it stays visible as context
+  ;; Make the current input line visible as context (editable, Eshell-style)
   (let ((inhibit-read-only t))
     (goto-char (point-max))
     (insert "\n")
-    (add-text-properties isqlm-last-output-end (point)
-                         '(read-only t rear-nonsticky t field input))
+    (add-text-properties isqlm-last-output-end (1- (point))
+                         '(rear-nonsticky (read-only) field input))
+    (add-text-properties (1- (point)) (point)
+                         '(read-only t rear-nonsticky (read-only) field input))
     (set-marker isqlm-last-output-end (point)))
   ;; Reset history navigation
   (setq isqlm-history-index nil)
@@ -3806,6 +3952,8 @@ Type `\\help' at the prompt for built-in commands.
   (setq-local font-lock-defaults '(isqlm-font-lock-keywords nil t))
   ;; History
   (isqlm--history-init)
+  ;; isearch history support (Eshell-style M-r)
+  (add-hook 'isearch-mode-hook #'isqlm--history-isearch-setup nil t)
   ;; Kill buffer hook
   (add-hook 'kill-buffer-hook
             (lambda ()

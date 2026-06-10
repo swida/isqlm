@@ -96,7 +96,7 @@ User presses RET
 
 ### History Re-execution
 
-When the cursor is in the history area (before `isqlm-last-output-end`), pressing `RET` extracts the text of the current line, strips any prompt prefix (`SQL> ` or `  -> `), and copies it to the current input area — but does **not** immediately execute. The user can then edit the copied text and press `RET` again to execute. This mirrors Eshell behavior: navigate up to a previous command, press `RET` to grab it into the editable input area, modify if needed, then `RET` to run.
+When the cursor is in the history area (before `isqlm-last-output-end`), pressing `RET` extracts the text of the current line, strips any prompt prefix (`SQL> ` or `  -> `), copies it to the current input area, and executes it. Past input lines are **not** read-only (only the trailing newline is), so the user can edit them in place before pressing `RET` — this mirrors Eshell behavior. Output and prompt regions remain read-only.
 
 ### Multi-line Input
 
@@ -747,6 +747,7 @@ The ISQLM buffer sets `truncate-lines` to `nil`, so Emacs visually wraps long li
 - Persistence: `isqlm-history-file-name` (default `~/.emacs.d/isqlm-history`), one entry per line
 - Deduplication: consecutive identical inputs are not recorded
 - Navigation: `M-p` / `M-n`; current input is saved to `isqlm-input-saved` on entry
+- Search: `M-r` starts incremental regexp search through history (Eshell-style), using Emacs's isearch framework with custom functions that traverse the history ring and display matches on the command line; `DEL` backtracks, `RET`/`C-g` exits
 - Auto-save: via `kill-buffer-hook` and `kill-emacs-hook`
 
 **Important**: `isqlm--history-save` captures `isqlm-history-ring` (buffer-local) into a `let` binding before entering `with-temp-file`, since the macro switches to a temp buffer where buffer-local variables are nil.
@@ -766,6 +767,7 @@ The ISQLM buffer sets `truncate-lines` to `nil`, so Emacs visually wraps long li
 | `C-c C-t` | `isqlm-show-tables` | SHOW TABLES |
 | `C-c C-d` | `isqlm-describe-table` | DESCRIBE TABLE |
 | `M-p` / `M-n` | History navigation | Previous / next history |
+| `M-r` | `isqlm-history-search` | Incremental regexp search through history (isearch-based) |
 | `C-a` | `isqlm-bol` | Jump to input start |
 
 ## 10. Customization Options (defcustom)
