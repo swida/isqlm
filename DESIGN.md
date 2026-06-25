@@ -201,6 +201,7 @@ This expansion happens after statement splitting and before `isqlm--execute-sql`
 | `\endif` | `isqlm/endif` | End conditional block |
 | `\gset` | `isqlm/gset` | Store last query result as variables |
 | `\genddl` | `isqlm/genddl` | Generate DDL+DML for tables referenced in SQL |
+| `\placement` | `isqlm/placement` | View/change table/partition node placement (TDSQL 3) |
 | `\i`/`\include` | `isqlm/i` | Execute SQL from file (`-` for script editor) |
 | `\clear` | `isqlm/clear` | Clear buffer |
 | `\history` | `isqlm/history` | Show history |
@@ -471,6 +472,198 @@ INSERT INTO `t3` (`a`, `b`, `c`) VALUES
 | `isqlm--genddl-parse-columns-from-ddl` | Parse column name/type from DDL string |
 | `isqlm--genddl-fetch-data` | Fetch real rows via `SELECT ... LIMIT` for DML |
 | `isqlm--genddl-format-value` | Format a value for INSERT — type-aware quoting |
+
+## 4.7 View/Change Node Placement (`\placement`) — TDSQL 3
+
+View which node a table or partition is stored on, or split its region so that future inserts go to a new node.  Uses TDSQL 3 SQL interface (`ALTER INSTANCE SPLIT` / `MIGRATE` / `TRANSFER LEADER`) — no MC REST API calls needed.
+
+**Syntax**:
+
+| Form | Description |
+|------|-------------|
+| `\placement` | Show usage + list available cluster nodes |
+| `\placement TARGET` | Show current node for TARGET |
+| `\placement TARGET NODE` | Split region + place new RG's leader on NODE so future writes go there |
+
+**TARGET format**: `[db.]table[.partition]`
+
+| Input | Interpretation |
+|-------|---------------|
+| `t1` | Current database, table `t1` |
+| `test.t1` | Database `test`, table `t1` |
+| `test.t1.p0` | Database `test`, table `t1`, partition `p0` |
+| `t1.p0` | Current database, table `t1`, partition `p0` (detected by `p` + digit prefix) |
+
+**NODE**: Exact node name, 0-based index, or suffix match.
+
+### Workflow (when NODE is given)
+
+The table must have a PRIMARY KEY.
+
+**Step 0 — Split range block** at the split key:
+
+```sql
+-- Check if range block boundary exists at split key
+SELECT range_block_id FROM information_schema.TDSTORE_RANGE_BLOCK_INFO
+  WHERE start_key = '<split_key>';
+
+-- If not, split the range block (required before region split)
+CALL dbms_admin.launch_range_block_job(1, 0, '<prefix>', '<split_key>');
+
+-- Poll information_schema.TDSTORE_RANGE_BLOCK_INFO until boundary appears
+```
+
+Region split in TDStore requires the split key to align with a **range block boundary**.  Range blocks are the internal fine-grained units within a region; each manages a contiguous key range with its own transaction lock unit.  If no range block boundary exists at the split key, the region split will be rejected with `EC_TDS_INVALID_ARGUMENT`.
+
+**Step 1 — Split region** at `MAX(pk)`:
+
+```sql
+-- Get storage prefix (hex)
+SELECT LPAD(HEX(tindex_id),8,'0') FROM information_schema.tables
+  WHERE table_schema='<db>' AND table_name='<table>';
+-- For partitioned tables:
+SELECT TINDEX_ID_STORAGE_FORMAT FROM information_schema.PARTITION_INDEXES
+  WHERE ... AND index_name='PRIMARY';
+
+-- Get encoded key for MAX(pk)
+SELECT SUBSTRING_INDEX(SUBSTRING_INDEX(MYROCK_ENCODE(),';',1),':',-1)
+  FROM <db>.<table> FORCE INDEX(PRIMARY) WHERE <pk> = MAX(<pk>);
+
+-- split_key = prefix + encoded_key
+-- Split the region
+ALTER INSTANCE SPLIT REGION <region_id> IN RG <rg_id> AT KEY '<split_key>' FORCE;
+
+-- Poll META_CLUSTER_REGIONS until new region appears
+```
+
+**Step 2 — Split RG** to move the new region into a separate RG:
+
+```sql
+ALTER INSTANCE SPLIT RG <rg_id> BY 'manual-assigned'
+  SET 'right_regions' = '<new_region_id>';
+```
+
+**Step 3 — Place the new RG's leader on the target node.**
+
+`SPLIT RG` returns OK only means the job was *submitted*; the new RG's replicas
+and snapshot are populated asynchronously.  Moreover, `MIGRATE` only moves a
+*replica* — it does **not** move the raft leader.  To make future writes land on
+the target node, the new RG's **leader** must be on it.  The implementation
+therefore:
+
+1. **Wait for the new RG to become working** (leader elected, split synced) by
+   polling `rep_group_state` for `L_Working`.
+2. **Ensure the target node has a replica.**  In a cluster where the number of
+   nodes equals the replica count (e.g. 3 nodes / 3 replicas), every RG already
+   has a replica on every node, so this is a no-op.  Otherwise, migrate one
+   there (retrying while the parent-RG snapshot condition is not yet met):
+
+   ```sql
+   ALTER INSTANCE MIGRATE RG <new_rg_id> TO '<target_node>';
+   ```
+
+3. **Transfer leadership to the target node**, retrying until the follower is
+   working (the new follower may briefly be in `RG_STATE_F_ONLINE`) and the
+   leader is confirmed on the target:
+
+   ```sql
+   ALTER INSTANCE TRANSFER LEADER RG <new_rg_id> TO '<target_node>';
+   ```
+
+   After each attempt, `leader_node_name` from `META_CLUSTER_RGS` is checked to
+   confirm the leader has actually moved.
+
+**Step 4 — Flush route**:
+
+```sql
+CALL dbms_admin.flush_route();
+```
+
+After this, all subsequent inserts with `pk > MAX(pk)` at split time go to the new node.
+
+### Information Schema Tables Used
+
+| Table | Purpose |
+|-------|---------|
+| `information_schema.meta_cluster_nodes` | List all cluster node names |
+| `information_schema.META_CLUSTER_TABLE_LOCATION` | Table → RG → leader node mapping |
+| `information_schema.META_CLUSTER_REGIONS` | Region → RG mapping, start/end keys |
+| `information_schema.META_CLUSTER_RGS` | RG members, leader, quorum |
+| `information_schema.TDSTORE_RANGE_BLOCK_INFO` | Range block boundaries within regions |
+| `information_schema.tables` | `tindex_id` for non-partitioned tables |
+| `information_schema.PARTITION_INDEXES` | `TINDEX_ID_STORAGE_FORMAT` for partitioned tables |
+| `INFORMATION_SCHEMA.STATISTICS` | Primary key column names |
+
+### SQL Commands Used
+
+| Step | SQL | Description |
+|------|-----|-------------|
+| 0 | `CALL dbms_admin.launch_range_block_job(1, 0, start, split)` | Split range block at split key |
+| 1 | `ALTER INSTANCE SPLIT REGION ... IN RG ... AT KEY ... FORCE` | Split region at split key |
+| 2 | `ALTER INSTANCE SPLIT RG ... BY 'manual-assigned' SET 'right_regions' = ...` | Move new region to new RG |
+| 3a | `ALTER INSTANCE MIGRATE RG ... TO ...` | Add a replica on the target node (only when it has none) |
+| 3b | `ALTER INSTANCE TRANSFER LEADER RG ... TO ...` | Move the new RG's leader to the target node (retried) |
+| 4 | `CALL dbms_admin.flush_route()` | Refresh routing table |
+
+### Implementation
+
+| Function | Description |
+|----------|-------------|
+| `isqlm/placement` | Meta command entry point |
+| `isqlm--placement-parse-target` | Parse `[db.]table[.partition]` string |
+| `isqlm--placement-show-info` | Query `META_CLUSTER_TABLE_LOCATION` and display |
+| `isqlm--placement-get-nodes` | Query `meta_cluster_nodes` |
+| `isqlm--placement-resolve-node` | Resolve node hint (exact/index/suffix) |
+| `isqlm--placement-get-region-info` | Get region_id, rg_id from `META_CLUSTER_REGIONS` |
+| `isqlm--placement-get-pk-col` | Get PRIMARY KEY column from `STATISTICS` |
+| `isqlm--placement-get-storage-prefix` | Get hex prefix from `tindex_id` or `PARTITION_INDEXES` |
+| `isqlm--placement-get-encode-key` | Encode key via `MYROCK_ENCODE()` |
+| `isqlm--placement-split-range-block` | Step 0: split range block + poll |
+| `isqlm--placement-split-region-sql` | Step 1: `ALTER INSTANCE SPLIT REGION` |
+| `isqlm--placement-rg-has-node` | Check whether an RG already has a replica on a node |
+| `isqlm--placement-wait-rg-working` | Poll `rep_group_state` until `L_Working` |
+| `isqlm--placement-rg-leader-is` | Check whether an RG's leader is a given node |
+| `isqlm--placement-place-rg-leader` | Step 3: wait-for-working → optional `MIGRATE` → retry `TRANSFER LEADER` until leader confirmed on target |
+
+### Examples
+
+```
+SQL> \placement
+Usage:
+  \placement [db.]table[.partition]         show current node
+  \placement [db.]table[.partition] NODE    split + migrate
+
+Available nodes:
+  [0] node-1-002
+  [1] node-1-003
+  [2] node-1-001
+
+SQL> \placement test.t2
+test.t2:
+  RG 95067 → node-1-002
+
+SQL> \placement test.t2 node-1-001
+[placement] test.t2: split at MAX(a)=51190, target → node-1-001
+[placement] Step 0: Split range block
+[placement] Splitting range block at '000027468000C7F6'...
+[placement] CALL dbms_admin.launch_range_block_job(1, 0, '00002746', '000027468000C7F6')
+[placement] Range block split done
+[placement] Step 1: Split region 373 in RG 95067 at key '000027468000C7F6'
+[placement] ALTER INSTANCE SPLIT REGION 373 IN RG 95067 AT KEY '000027468000C7F6' FORCE
+[placement] Waiting for region split (C-c C-c to cancel)...
+[placement] Region split done (1082)
+[placement] Step 2: Split RG 95067 (move region 1082 to new RG)
+[placement] ALTER INSTANCE SPLIT RG 95067 BY 'manual-assigned' SET 'right_regions' = '1082'
+[placement] Step 3: Place leader of RG 278619 on node-1-001
+[placement] ALTER INSTANCE TRANSFER LEADER RG 278619 TO 'node-1-001'
+[placement] Leader now on node-1-001
+[placement] Route flushed. Done.
+
+SQL> \placement test.t2
+test.t2:
+  RG 95067 → node-1-002
+  RG 278619 → node-1-001
+```
 
 ## 5. SQL Execution Layer
 

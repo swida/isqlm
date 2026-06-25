@@ -1597,6 +1597,11 @@ _SQL is the original statement (unused), MODE is the terminator mode."
     "  \\for VAR in V1 V2 ... { body }\n"
     "                         loop over values\n"
     "\n"
+    "TDSQL 3\n"
+    "  \\placement TARGET           show table/partition node\n"
+    "  \\placement TARGET NODE      split + migrate future writes to NODE\n"
+    "                              TARGET: [db.]table[.partition]\n"
+    "\n"
     "Variables & Elisp\n"
     "  \\setq VAR VALUE        set an Emacs variable\n"
     "  \\eval EXPR             evaluate Elisp expression\n"
@@ -3128,6 +3133,560 @@ Returns symbol `killed' so the caller knows not to touch the buffer."
     (quit-window)
     (kill-buffer buf))
   'killed)
+
+;; ============================================================
+;; \placement — view/change table/partition node placement (TDSQL 3)
+;; Uses SQL interface: ALTER INSTANCE SPLIT/MIGRATE
+;; ============================================================
+
+(defun isqlm--placement-parse-target (target)
+  "Parse TARGET string into (DB TABLE PARTITION).
+TARGET formats:
+  table           → (current-db, table, nil)
+  db.table        → (db, table, nil)
+  db.table.part   → (db, table, part)
+  table.part      → (current-db, table, part)
+Returns a plist (:db DB :table TABLE :partition PART)."
+  (let* ((parts (split-string target "\\." t))
+         (nparts (length parts))
+         (cur-db (plist-get isqlm-connection-info :database)))
+    (pcase nparts
+      (1 (list :db cur-db :table (nth 0 parts) :partition nil))
+      (2 ;; Ambiguous: db.table or table.partition
+       ;; Heuristic: if part2 starts with "p" followed by digits, treat as partition
+       (if (string-match-p "\\`p[0-9]" (nth 1 parts))
+           (list :db cur-db :table (nth 0 parts) :partition (nth 1 parts))
+         (list :db (nth 0 parts) :table (nth 1 parts) :partition nil)))
+      (3 (list :db (nth 0 parts) :table (nth 1 parts) :partition (nth 2 parts)))
+      (_ (error "Invalid target format: %s (use [db.]table[.partition])" target)))))
+
+(defun isqlm--placement-query-rows (sql)
+  "Run SQL and return its result rows, or nil if it is not a SELECT or is empty."
+  (let ((result (isqlm-execute-string sql)))
+    (and result
+         (eq (plist-get result :type) 'select)
+         (plist-get result :rows))))
+
+(defun isqlm--placement-query-scalar (sql)
+  "Run SQL and return the first column of the first row, or nil."
+  (caar (isqlm--placement-query-rows sql)))
+
+(defun isqlm--placement-poll (tries interval check-fn &optional on-wait)
+  "Poll CHECK-FN up to TRIES times, sleeping INTERVAL seconds before each try.
+Return the first non-nil value CHECK-FN produces, or nil on timeout.  The wait
+uses `sit-for', so it stays responsive and is cancellable with C-g / C-c C-c.
+ON-WAIT, when non-nil, is called with the 1-based attempt count after each
+unsuccessful check (use it to print progress)."
+  (let ((value nil))
+    (dotimes (i tries)
+      (unless value
+        (sit-for interval)
+        (setq value (funcall check-fn))
+        (when (and (not value) on-wait)
+          (funcall on-wait (1+ i)))))
+    value))
+
+(defun isqlm--placement-get-nodes ()
+  "Get all cluster node names from information_schema.meta_cluster_nodes."
+  (mapcar #'car
+          (isqlm--placement-query-rows
+           "SELECT node_name FROM information_schema.meta_cluster_nodes")))
+
+(defun isqlm--placement-resolve-node (hint all-nodes)
+  "Resolve node HINT to real name from ALL-NODES.
+Supports exact, case-insensitive, index, suffix."
+  (let ((h (string-trim hint)))
+    (or (cl-find h all-nodes :test #'string=)
+        (cl-find-if (lambda (n) (string= (downcase n) (downcase h))) all-nodes)
+        (and (string-match-p "\\`[0-9]+\\'" h)
+             (let ((idx (string-to-number h)))
+               (and (>= idx 0) (< idx (length all-nodes))
+                    (nth idx all-nodes))))
+        (cl-find-if (lambda (n) (string-suffix-p h n)) all-nodes)
+        (error "Cannot resolve node '%s'. Available: %s" h all-nodes))))
+
+(defun isqlm--placement-rg-leader (rg-id)
+  "Return the current leader node name of RG-ID, or nil."
+  (isqlm--placement-query-scalar
+   (format
+    "SELECT leader_node_name FROM information_schema.META_CLUSTER_RGS WHERE rep_group_id=%s"
+    rg-id)))
+
+(defun isqlm--placement-show-info (db table partition)
+  "Show current placement (RG -> leader node) for TABLE or PARTITION in DB.
+For a PARTITION we resolve the RGs from that partition's own regions, so each
+partition reports only its own RGs.  Without PARTITION we use the aggregated
+table->RG->leader mapping in META_CLUSTER_TABLE_LOCATION."
+  (let ((target-name (if partition
+                         (format "%s.%s.%s" db table partition)
+                       (format "%s.%s" db table))))
+    (if partition
+        (let ((rg-ids (delete-dups
+                       (mapcar (lambda (r) (plist-get r :rg-id))
+                               (isqlm--placement-get-region-info
+                                db table partition)))))
+          (if rg-ids
+              (progn
+                (isqlm--output-info (format "%s:\n" target-name))
+                (dolist (rg rg-ids)
+                  (isqlm--output-info
+                   (format "  RG %s → %s\n" rg
+                           (or (isqlm--placement-rg-leader rg) "?")))))
+            (isqlm--output-info
+             (format "%s: no regions found\n" target-name))))
+      (let ((rows (isqlm--placement-query-rows
+                   (format
+                    "SELECT DISTINCT rep_group_id, leader_node_name FROM information_schema.META_CLUSTER_TABLE_LOCATION WHERE schema_name='%s' AND table_name='%s'"
+                    db table))))
+        (if rows
+            (progn
+              (isqlm--output-info (format "%s:\n" target-name))
+              (dolist (row rows)
+                (isqlm--output-info
+                 (format "  RG %s → %s\n" (nth 0 row) (nth 1 row)))))
+          (isqlm--output-info
+           (format "%s: not found in META_CLUSTER_TABLE_LOCATION\n"
+                   target-name)))))))
+
+(defun isqlm--placement-get-region-info (db table &optional partition)
+  "Get region info for TABLE (or PARTITION) in DB.
+Return a list of plists (:region-id ID :rg-id RG :start-key S :end-key E)."
+  (let ((tindex-id (isqlm--placement-query-scalar
+                    (if partition
+                        (format
+                         "SELECT TINDEX_ID FROM INFORMATION_SCHEMA.PARTITIONS_VERBOSE WHERE table_schema='%s' AND table_name='%s' AND partition_name='%s'"
+                         db table partition)
+                      (format
+                       "SELECT tindex_id FROM information_schema.tables WHERE table_schema='%s' AND table_name='%s'"
+                       db table)))))
+    (when tindex-id
+      (mapcar (lambda (row)
+                (list :region-id (nth 0 row) :rg-id (nth 1 row)
+                      :start-key (nth 2 row) :end-key (nth 3 row)))
+              (isqlm--placement-query-rows
+               (format
+                "SELECT region_id, rep_group_id, start_key, end_key FROM information_schema.META_CLUSTER_REGIONS WHERE data_obj_id=%s"
+                tindex-id))))))
+
+(defun isqlm--placement-get-pk-col (db table)
+  "Get the first primary key column name for TABLE in DB."
+  (isqlm--placement-query-scalar
+   (format
+    "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA='%s' AND TABLE_NAME='%s' AND INDEX_NAME='PRIMARY' ORDER BY SEQ_IN_INDEX LIMIT 1"
+    db table)))
+
+(defun isqlm--placement-get-storage-prefix (db table &optional partition)
+  "Get the hex storage prefix for TABLE (or PARTITION) in DB.
+For a partition, prefer TINDEX_ID_STORAGE_FORMAT from PARTITION_INDEXES; when
+the table has no PRIMARY index, fall back to LPAD(HEX(TINDEX_ID),8,'0') derived
+from PARTITIONS_VERBOSE (the same TINDEX_ID used to locate the regions).
+For a non-partitioned table, derive it from `tindex_id'."
+  (if partition
+      (or (isqlm--placement-query-scalar
+           (format
+            "SELECT TINDEX_ID_STORAGE_FORMAT FROM information_schema.PARTITION_INDEXES WHERE table_schema='%s' AND table_name='%s' AND partition_name='%s' AND index_name='PRIMARY'"
+            db table partition))
+          (isqlm--placement-query-scalar
+           (format
+            "SELECT LPAD(HEX(TINDEX_ID),8,'0') FROM information_schema.PARTITIONS_VERBOSE WHERE table_schema='%s' AND table_name='%s' AND partition_name='%s'"
+            db table partition)))
+    (isqlm--placement-query-scalar
+     (format
+      "SELECT LPAD(HEX(tindex_id),8,'0') FROM information_schema.tables WHERE table_schema='%s' AND table_name='%s'"
+      db table))))
+
+(defun isqlm--placement-get-encode-key (db table where-clause)
+  "Get the encoded key for the row matching WHERE-CLAUSE using MYROCK_ENCODE()."
+  (isqlm--placement-query-scalar
+   (format
+    "SELECT SUBSTRING_INDEX(SUBSTRING_INDEX(MYROCK_ENCODE(),';',1),':',-1) FROM `%s`.`%s` FORCE INDEX(PRIMARY) WHERE %s"
+    db table where-clause)))
+
+(defun isqlm--placement-get-max-encoded-key (db table &optional partition)
+  "Get the largest encoded clustered key in TABLE (or PARTITION) of DB.
+Works for tables without a PRIMARY KEY: it orders the per-row encoded keys
+themselves (MyRocks encodes the hidden rowid big-endian, so the lexically
+largest encoded key is the physically last row).  No index hint is used, so
+the hidden clustered index is scanned even when there is no PRIMARY key."
+  (isqlm--placement-query-scalar
+   (format
+    "SELECT SUBSTRING_INDEX(SUBSTRING_INDEX(MYROCK_ENCODE(),';',1),':',-1) AS k FROM `%s`.`%s`%s ORDER BY k DESC LIMIT 1"
+    db table (if partition (format " PARTITION (%s)" partition) ""))))
+
+(defun isqlm--placement-split-range-block (split-key)
+  "Split the range block covering SPLIT-KEY.
+Region split requires the split key to align with a range block boundary.
+Finds the range block containing SPLIT-KEY and splits it using
+launch_range_block_job(is_split=1, is_random=0, rb_start_key, split_key)."
+  (if (isqlm--placement-query-scalar
+       (format
+        "SELECT range_block_id FROM information_schema.TDSTORE_RANGE_BLOCK_INFO WHERE start_key = '%s' LIMIT 1"
+        split-key))
+      (isqlm--output-info
+       "[placement] Range block boundary already exists at split key\n")
+    (let ((rb-start (isqlm--placement-query-scalar
+                     (format
+                      "SELECT start_key FROM information_schema.TDSTORE_RANGE_BLOCK_INFO WHERE start_key <= '%s' AND end_key > '%s' AND range_block_state = 'kNormal' LIMIT 1"
+                      split-key split-key))))
+      (unless rb-start
+        (error "Cannot find range block containing key '%s'" split-key))
+      (isqlm--output-info
+       (format "[placement] Splitting range block [%s...) at '%s'\n"
+               rb-start split-key))
+      (let ((rb-sql (format
+                     "CALL dbms_admin.launch_range_block_job(1, 0, '%s', '%s')"
+                     rb-start split-key)))
+        (isqlm--output-info (format "[placement] %s\n" rb-sql))
+        (isqlm-execute-string rb-sql))
+      (if (isqlm--placement-poll
+           30 1
+           (lambda ()
+             (isqlm--placement-query-scalar
+              (format
+               "SELECT range_block_id FROM information_schema.TDSTORE_RANGE_BLOCK_INFO WHERE start_key = '%s' LIMIT 1"
+               split-key)))
+           (lambda (n)
+             (isqlm--output-info
+              (format "[placement] ... waiting for range block split %ds\n" n))))
+          (isqlm--output-info "[placement] Range block split done\n")
+        (error "Range block split did not take effect within 30s")))))
+
+(defun isqlm--placement-split-region-sql (region-id rg-id split-key)
+  "Split REGION-ID in RG-ID at SPLIT-KEY using SQL interface.
+Returns the result of ALTER INSTANCE SPLIT REGION."
+  (let ((sql (format
+              "ALTER INSTANCE SPLIT REGION %s IN RG %s AT KEY '%s' FORCE"
+              region-id rg-id split-key)))
+    (isqlm--output-info (format "[placement] %s\n" sql))
+    (isqlm-execute-string sql)))
+
+(defun isqlm--placement-rg-has-node (rg-id node)
+  "Return non-nil if RG-ID already has a replica on NODE."
+  (let ((members (isqlm--placement-query-scalar
+                  (format
+                   "SELECT member_node_names FROM information_schema.META_CLUSTER_RGS WHERE rep_group_id=%s"
+                   rg-id))))
+    (and (stringp members)
+         (string-match-p (regexp-quote node) members))))
+
+(defun isqlm--placement-rg-leader-is (rg-id node)
+  "Return non-nil if the leader of RG-ID is currently NODE."
+  (let ((leader (isqlm--placement-rg-leader rg-id)))
+    (and (stringp leader) (string= leader node))))
+
+(defun isqlm--placement-wait-rg-working (rg-id)
+  "Wait until RG-ID has a working leader (rep_group_state contains L_Working).
+Polls up to 30s.  Returns non-nil once ready."
+  (isqlm--placement-poll
+   30 1
+   (lambda ()
+     (let ((state (isqlm--placement-query-scalar
+                   (format
+                    "SELECT rep_group_state FROM information_schema.META_CLUSTER_RGS WHERE rep_group_id=%s"
+                    rg-id))))
+       (and (stringp state) (string-match-p "L_Working" state))))
+   (lambda (n)
+     (isqlm--output-info
+      (format "[placement] ... waiting for RG %s ready %ds\n" rg-id n)))))
+
+(defun isqlm--placement-place-rg-leader (rg-id node)
+  "Make NODE the raft leader of RG-ID, migrating a replica there if needed.
+
+The new RG produced by SPLIT RG inherits replicas from its parent, but its
+membership/snapshot may not be populated immediately.  We therefore:
+  1. Wait for the RG to become working (leader elected, split synced).
+  2. If NODE has no replica yet, MIGRATE one there (retrying while the parent
+     RG snapshot condition is not yet met) and wait for it to join.
+  3. TRANSFER LEADER to NODE, retrying until the follower is working and the
+     leader is confirmed on NODE."
+  (isqlm--output-info
+   (format "[placement] Step 3: Place leader of RG %s on %s\n" rg-id node))
+  ;; 1. Wait for the new RG to settle after the split.
+  (isqlm--placement-wait-rg-working rg-id)
+  ;; 2. Ensure NODE has a replica (only needed when #nodes > #replicas).
+  (unless (isqlm--placement-rg-has-node rg-id node)
+    (let ((migrated nil))
+      (dotimes (attempt 6)
+        (unless migrated
+          (condition-case err
+              (let ((sql (format "ALTER INSTANCE MIGRATE RG %s TO '%s'"
+                                 rg-id node)))
+                (isqlm--output-info (format "[placement] %s\n" sql))
+                (isqlm-execute-string sql)
+                (setq migrated t))
+            (error
+             (if (< attempt 5)
+                 (progn
+                   (isqlm--output-info
+                    (format "[placement] Migrate retry in 5s (%s)...\n"
+                            (error-message-string err)))
+                   (sit-for 5))
+               (signal (car err) (cdr err)))))))
+      ;; Wait for NODE to actually join as a member.
+      (let ((joined nil))
+        (dotimes (i 30)
+          (unless joined
+            (sit-for 2)
+            (if (isqlm--placement-rg-has-node rg-id node)
+                (setq joined t)
+              (isqlm--output-info
+               (format "[placement] ... waiting for replica on %s %ds\n"
+                       node (* 2 (1+ i)))))))))
+    (isqlm--placement-wait-rg-working rg-id))
+  ;; 3. Transfer leadership to NODE (retry until confirmed).
+  (let ((leader-ok nil))
+    (dotimes (_ 30)
+      (unless leader-ok
+        (if (isqlm--placement-rg-leader-is rg-id node)
+            (setq leader-ok t)
+          (condition-case err
+              (let ((sql (format "ALTER INSTANCE TRANSFER LEADER RG %s TO '%s'"
+                                 rg-id node)))
+                (isqlm--output-info (format "[placement] %s\n" sql))
+                (isqlm-execute-string sql)
+                (sit-for 2)
+                (when (isqlm--placement-rg-leader-is rg-id node)
+                  (setq leader-ok t)))
+            (error
+             (isqlm--output-info
+              (format "[placement] ... follower not ready, retry in 3s (%s)\n"
+                      (error-message-string err)))
+             (sit-for 3))))))
+    (if leader-ok
+        (isqlm--output-info (format "[placement] Leader now on %s\n" node))
+      (isqlm--output-info
+       "[placement] Warning: leader may not be on target node yet\n"))))
+
+(defun isqlm--placement-usage ()
+  "Print \\placement usage text and the list of available cluster nodes."
+  (isqlm--output-info
+   (concat "Usage:\n"
+           "  \\placement [db.]table[.partition]         show current node\n"
+           "  \\placement [db.]table[.partition] NODE    split + place leader\n"
+           "\nAvailable nodes:\n"))
+  (condition-case nil
+      (let ((nodes (isqlm--placement-get-nodes)))
+        (if nodes
+            (cl-loop for n in nodes for i from 0
+                     do (isqlm--output-info (format "  [%d] %s\n" i n)))
+          (isqlm--output-info "  (could not retrieve nodes)\n")))
+    (error (isqlm--output-info "  (could not retrieve nodes)\n"))))
+
+(defun isqlm--placement-compute-split-key (db table partition pk-col prefix
+                                              target-name)
+  "Compute the split key and a human label for TABLE/PARTITION in DB.
+With a PK-COL, split at the encoded MAX(PK-COL).  Without one, split at the
+largest encoded clustered key.  PREFIX is the storage prefix; TARGET-NAME is
+used in errors.  Return a cons (SPLIT-KEY . LABEL); signal if empty/unencodable."
+  (let (encoded-key label)
+    (if pk-col
+        (let ((max-val (isqlm--placement-query-scalar
+                        (if partition
+                            (format "SELECT MAX(`%s`) FROM `%s`.`%s` PARTITION (%s)"
+                                    pk-col db table partition)
+                          (format "SELECT MAX(`%s`) FROM `%s`.`%s`"
+                                  pk-col db table)))))
+          (unless max-val
+            (error "%s is empty, cannot determine split point" target-name))
+          (setq encoded-key (isqlm--placement-get-encode-key
+                             db table
+                             (format "`%s` = %s" pk-col
+                                     (if (stringp max-val)
+                                         (format "'%s'" max-val)
+                                       (format "%s" max-val))))
+                label (format "MAX(%s)=%s" pk-col max-val)))
+      ;; No PRIMARY KEY: split at the largest encoded clustered key.
+      (setq encoded-key (isqlm--placement-get-max-encoded-key
+                         db table partition)
+            label "max clustered key"))
+    (unless encoded-key
+      (error "%s is empty or its key cannot be encoded" target-name))
+    (cons (concat prefix encoded-key) label)))
+
+(defun isqlm--placement-find-region-for-key (regions split-key)
+  "Return the region in REGIONS whose [start,end) range contains SPLIT-KEY.
+Falls back to the last region when none matches."
+  (let ((sk (downcase split-key)))
+    (or (cl-find-if
+         (lambda (r)
+           (let ((rstart (downcase (plist-get r :start-key)))
+                 (rend (downcase (plist-get r :end-key))))
+             (and (not (string< sk rstart)) (string< sk rend))))
+         regions)
+        (car (last regions)))))
+
+(defun isqlm--placement-region-already-split (regions split-key)
+  "Return the region in REGIONS that already starts exactly at SPLIT-KEY, or nil."
+  (let ((sk (downcase split-key)))
+    (cl-find-if (lambda (r) (string= (downcase (plist-get r :start-key)) sk))
+                regions)))
+
+(defun isqlm--placement-wait-region-split (db table partition region-id)
+  "Poll up to 30s for REGION-ID to split into a new region.
+Return the new region id, or nil on timeout."
+  (isqlm--placement-poll
+   30 1
+   (lambda ()
+     (cl-find-if
+      (lambda (id) (not (equal id region-id)))
+      (mapcar (lambda (r) (plist-get r :region-id))
+              (isqlm--placement-get-region-info db table partition))))
+   (lambda (n) (isqlm--output-info (format "[placement] ... %ds\n" n)))))
+
+(defun isqlm--placement-do-region-split (db table partition split-key
+                                            region-id rg-id)
+  "Split the range block and REGION-ID (in RG-ID) at SPLIT-KEY, then wait.
+Return the new region id, or nil if the split did not take effect."
+  (isqlm--output-info "[placement] Step 0: Split range block\n")
+  (isqlm--placement-split-range-block split-key)
+  (isqlm--output-info
+   (format "[placement] Step 1: Split region %s in RG %s at key '%s'\n"
+           region-id rg-id split-key))
+  (isqlm--placement-split-region-sql region-id rg-id split-key)
+  (isqlm--output-info
+   "[placement] Waiting for region split (C-c C-c to cancel)...\n")
+  (let ((new-region (isqlm--placement-wait-region-split
+                     db table partition region-id)))
+    (isqlm--output-info
+     (if new-region
+         (format "[placement] Region split done (%s)\n" new-region)
+       "[placement] Region split timeout (30s)\n"))
+    new-region))
+
+(defun isqlm--placement-split-rg (rg-id new-region)
+  "Split RG-ID, moving NEW-REGION into a freshly created RG.
+A failure is reported but not re-raised (the new RG may still be usable)."
+  (isqlm--output-info
+   (format "[placement] Step 2: Split RG %s (move region %s to new RG)\n"
+           rg-id new-region))
+  (let ((sql (format
+              "ALTER INSTANCE SPLIT RG %s BY 'manual-assigned' SET 'right_regions' = '%s'"
+              rg-id new-region)))
+    (isqlm--output-info (format "[placement] %s\n" sql))
+    (condition-case err
+        (isqlm-execute-string sql)
+      (error
+       (isqlm--output-info
+        (format "[placement] Split RG failed: %s\n"
+                (error-message-string err)))))))
+
+(defun isqlm--placement-find-new-rg (db table partition old-rg-id)
+  "Return the id of the RG created by splitting OLD-RG-ID, or nil."
+  (cl-find-if
+   (lambda (id) (not (equal id old-rg-id)))
+   (delete-dups
+    (mapcar (lambda (r) (plist-get r :rg-id))
+            (isqlm--placement-get-region-info db table partition)))))
+
+(defun isqlm--placement-split-rg-and-place (db table partition rg-id new-region
+                                              node)
+  "Split RG-ID to isolate NEW-REGION, then place the new RG's leader on NODE."
+  (isqlm--placement-split-rg rg-id new-region)
+  (sleep-for 3)
+  (let ((new-rg (isqlm--placement-find-new-rg db table partition rg-id)))
+    (if new-rg
+        (isqlm--placement-place-rg-leader new-rg node)
+      (isqlm--output-info
+       "[placement] Warning: Could not identify new RG after split\n"))))
+
+(defun isqlm--placement-change (db table partition node-arg)
+  "Split TABLE/PARTITION's tail region and route future writes to NODE-ARG.
+DB/TABLE/PARTITION identify the target; NODE-ARG is a node name/index/suffix."
+  (let* ((target-name (if partition
+                          (format "%s.%s.%s" db table partition)
+                        (format "%s.%s" db table)))
+         (all-nodes (isqlm--placement-get-nodes))
+         (node (isqlm--placement-resolve-node node-arg all-nodes))
+         (regions (isqlm--placement-get-region-info db table partition))
+         (pk-col (isqlm--placement-get-pk-col db table))
+         (prefix (isqlm--placement-get-storage-prefix db table partition)))
+    (unless regions (error "Cannot find region info for %s" target-name))
+    (unless prefix (error "Cannot get storage prefix for %s" target-name))
+    (let* ((sk (isqlm--placement-compute-split-key
+                db table partition pk-col prefix target-name))
+           (split-key (car sk))
+           (label (cdr sk))
+           (target-region (isqlm--placement-find-region-for-key
+                           regions split-key))
+           (region-id (plist-get target-region :region-id))
+           (rg-id (plist-get target-region :rg-id))
+           (already (isqlm--placement-region-already-split regions split-key))
+           (new-region nil))
+      (isqlm--output-info
+       (format "[placement] %s: split at %s, target → %s\n"
+               target-name label node))
+      (if already
+          ;; A previous \placement already split at this key.
+          (progn
+            (setq new-region (plist-get already :region-id))
+            (if (not (equal (plist-get already :rg-id) rg-id))
+                (progn
+                  (isqlm--output-info
+                   "[placement] Already split, skipping to migrate\n")
+                  (setq rg-id (plist-get already :rg-id)))
+              (isqlm--output-info
+               "[placement] Region already split, need RG split\n")))
+        (setq new-region (isqlm--placement-do-region-split
+                          db table partition split-key region-id rg-id)))
+      (if new-region
+          (isqlm--placement-split-rg-and-place
+           db table partition rg-id new-region node)
+        (isqlm--output-info
+         (concat
+          "[placement] Region split did not take effect.\n"
+          "[placement] This cluster may not support manual region split.\n"
+          "[placement] Ensure: sufficient data (OPTIMIZE TABLE to update stats),\n"
+          "[placement]   split-region-key-count-lower-bound satisfied,\n"
+          "[placement]   and TDStore supports split in this configuration.\n")))
+      ;; Refresh the SQL-layer route cache so new writes see the new RG.
+      (isqlm-execute-string "CALL dbms_admin.flush_route()")
+      (isqlm--output-info "[placement] Route flushed. Done.\n"))))
+
+(defun isqlm/placement (&rest args)
+  "View or change table/partition node placement (TDSQL 3).
+
+\\placement TARGET             show current node for TARGET
+\\placement TARGET NODE        split RG + place leader on NODE for future writes
+
+TARGET format: [db.]table[.partition]
+  table              use current database
+  db.table           specify database
+  db.table.p0        specify partition
+  table.p0           partition with current database
+
+NODE: node name, 0-based index, or suffix.
+
+When NODE is given:
+  1. Finds the table/partition's tail region and RG
+  2. Splits the region at MAX(pk) via ALTER INSTANCE SPLIT REGION
+  3. Splits the RG via ALTER INSTANCE SPLIT RG (new RG gets the new region)
+  4. Places the new RG's raft leader on NODE (MIGRATE if needed, then
+     TRANSFER LEADER) so future writes route there
+  5. Flushes the route cache
+
+Examples:
+  \\placement test.t1             show which node t1 is on
+  \\placement test.t1.p0          show which node partition p0 is on
+  \\placement t1 node-1-003       split + place leader, new writes → node-1-003
+  \\placement t1.p2 node-1-003    split partition p2, new writes → node-1-003"
+  (cond
+   ((not (isqlm--connected-p))
+    (isqlm--output-error "Not connected.\n"))
+   ((null args)
+    (isqlm--placement-usage))
+   (t
+    (condition-case err
+        (let* ((parsed (isqlm--placement-parse-target (car args)))
+               (db (plist-get parsed :db))
+               (table (plist-get parsed :table))
+               (partition (plist-get parsed :partition))
+               (node-arg (cadr args)))
+          (if (null node-arg)
+              (isqlm--placement-show-info db table partition)
+            (isqlm--placement-change db table partition node-arg)))
+      (error
+       (isqlm--output-error
+        (format "[placement] Error: %s\n" (error-message-string err))))))))
 
 ;; ============================================================
 ;; Conditional flow (\if / \elif / \else / \endif)

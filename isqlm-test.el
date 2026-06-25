@@ -549,4 +549,44 @@ Regression test: :varname was not expanded before eval."
   (should (equal (isqlm--genddl-format-value nil "int") "NULL"))
   (should (equal (isqlm--genddl-format-value nil "varchar(50)") "NULL")))
 
+;; ============================================================
+;; Placement tests
+;; ============================================================
+
+(ert-deftest isqlm-test-placement-parse-target ()
+  "Test parsing of placement target strings."
+  ;; Single name → current db + table
+  (let ((isqlm-connection-info '(:database "mydb")))
+    (should (equal (isqlm--placement-parse-target "t1")
+                   '(:db "mydb" :table "t1" :partition nil))))
+  ;; db.table
+  (let ((isqlm-connection-info '(:database "mydb")))
+    (should (equal (isqlm--placement-parse-target "test.t1")
+                   '(:db "test" :table "t1" :partition nil))))
+  ;; db.table.partition
+  (let ((isqlm-connection-info '(:database "mydb")))
+    (should (equal (isqlm--placement-parse-target "test.t1.p0")
+                   '(:db "test" :table "t1" :partition "p0"))))
+  ;; table.partition (partition starts with p + digit)
+  (let ((isqlm-connection-info '(:database "mydb")))
+    (should (equal (isqlm--placement-parse-target "t1.p3")
+                   '(:db "mydb" :table "t1" :partition "p3")))))
+
+(ert-deftest isqlm-test-placement-resolve-node ()
+  "Test node resolution from hints."
+  (let ((nodes '("node-1-002" "node-1-003" "node-1-001")))
+    ;; Exact match
+    (should (equal (isqlm--placement-resolve-node "node-1-002" nodes)
+                   "node-1-002"))
+    ;; Case-insensitive
+    (should (equal (isqlm--placement-resolve-node "Node-1-003" nodes)
+                   "node-1-003"))
+    ;; Index-based
+    (should (equal (isqlm--placement-resolve-node "0" nodes) "node-1-002"))
+    (should (equal (isqlm--placement-resolve-node "2" nodes) "node-1-001"))
+    ;; Suffix match (non-numeric to avoid index priority)
+    (should (equal (isqlm--placement-resolve-node "1-002" nodes) "node-1-002"))
+    ;; Error on unknown
+    (should-error (isqlm--placement-resolve-node "unknown" nodes))))
+
 ;;; isqlm-test.el ends here

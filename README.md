@@ -34,6 +34,7 @@ through the [`mysql-el`](https://github.com/swida/mysql-el) dynamic module (C FF
 - **psql-style `\l` commands** — `\l`, `\l+`, `\lx`, `\list` for listing databases with encoding, collation, size, and access privileges
 - **psql-style `\df` commands** — `\df`, `\dfn`, `\dfp`, `\df+` for listing functions and procedures with optional argument-type filtering
 - **Custom delimiter** — `DELIMITER //` or `\delimiter //` for creating stored procedures, functions, and triggers
+- **Node placement (TDSQL 3)** — `\placement` views table/partition placement and splits regions to route future writes to a new node
 
 ## Requirements
 
@@ -230,6 +231,7 @@ All built-in commands are prefixed with `\`:
 | `\eval EXPRESSION` | Evaluate Elisp expression |
 | `\for VAR in V1 V2 ... { body }` | Loop over values |
 | `\gset [PREFIX]` | Store last query result as variables |
+| `\placement TARGET [NODE]` | View/change table/partition node placement (TDSQL 3) |
 | `\i FILE` / `\include FILE` | Execute SQL from file (`-` for interactive editor) |
 | `\help` | Show help |
 | `\quit` / `\exit` | Disconnect and kill buffer |
@@ -408,6 +410,69 @@ SQL> \echo :pa :pb
 ```
 
 Each column becomes a variable named `PREFIX` + column name. The query must return exactly 1 row.
+
+### Node Placement (`\placement`) — TDSQL 3
+
+View which node a table/partition is on, or split its region so future inserts go to a new node.  The table must have a PRIMARY KEY.
+
+**List available nodes:**
+
+```
+SQL> \placement
+Available nodes:
+  [0] node-1-002
+  [1] node-1-003
+  [2] node-1-001
+```
+
+**View current placement:**
+
+```
+SQL> \placement test.t2
+test.t2:
+  RG 95067 → node-1-002
+```
+
+**Route future writes to a new node:**
+
+```
+SQL> \placement t2 node-1-001
+[placement] test.t2: split at MAX(a)=51190, target → node-1-001
+[placement] Step 0: Split range block
+[placement] Range block split done
+[placement] Step 1: Split region 373 in RG 95067
+[placement] Region split done (1082)
+[placement] Step 2: Split RG 95067 (move region 1082 to new RG)
+[placement] Step 3: Place leader of RG 278619 on node-1-001
+[placement] ALTER INSTANCE TRANSFER LEADER RG 278619 TO 'node-1-001'
+[placement] Leader now on node-1-001
+[placement] Route flushed. Done.
+
+SQL> \placement test.t2
+test.t2:
+  RG 95067 → node-1-002
+  RG 278619 → node-1-001
+```
+
+After this, inserts with `a > 51190` go to `node-1-001`.
+
+**Partition support** — use `db.table.partition` syntax:
+
+```
+SQL> \placement test.t2.p0 node-1-001
+```
+
+The command performs these steps internally:
+0. Split range block at the key (required for region split alignment)
+1. `ALTER INSTANCE SPLIT REGION ... AT KEY ... FORCE`
+2. `ALTER INSTANCE SPLIT RG ... BY 'manual-assigned'`
+3. Place the new RG's leader on the target node: wait until the RG is working,
+   `ALTER INSTANCE MIGRATE RG ... TO '...'` if the node has no replica yet, then
+   `ALTER INSTANCE TRANSFER LEADER RG ... TO '...'` (retried until the leader is
+   confirmed on the target — `MIGRATE` alone moves only a replica, not the leader)
+4. `CALL dbms_admin.flush_route()`
+
+TARGET format: `[db.]table[.partition]`. NODE can be an exact name, index (`0`, `1`), or suffix. Press `C-c C-c` to cancel during the wait.
 
 ### Script Editing (`\i -`)
 
