@@ -498,7 +498,11 @@ View which node a table or partition is stored on, or split its region so that f
 
 ### Workflow (when NODE is given)
 
-The table must have a PRIMARY KEY.
+The split point is the table's current maximum storage key, so that future
+inserts (which get larger keys) land in the new region.  A PRIMARY KEY is
+**not** required: when the table has one, the split key is the encoded
+`MAX(pk)`; otherwise it is the largest encoded clustered key (MyRocks encodes
+the hidden rowid big-endian, so ordering the encoded keys yields the last row).
 
 **Step 0 — Split range block** at the split key:
 
@@ -515,19 +519,26 @@ CALL dbms_admin.launch_range_block_job(1, 0, '<prefix>', '<split_key>');
 
 Region split in TDStore requires the split key to align with a **range block boundary**.  Range blocks are the internal fine-grained units within a region; each manages a contiguous key range with its own transaction lock unit.  If no range block boundary exists at the split key, the region split will be rejected with `EC_TDS_INVALID_ARGUMENT`.
 
-**Step 1 — Split region** at `MAX(pk)`:
+**Step 1 — Split region** at the table's max key:
 
 ```sql
 -- Get storage prefix (hex)
 SELECT LPAD(HEX(tindex_id),8,'0') FROM information_schema.tables
   WHERE table_schema='<db>' AND table_name='<table>';
--- For partitioned tables:
+-- For a partition (prefer PARTITION_INDEXES; fall back to PARTITIONS_VERBOSE
+-- when the table has no PRIMARY index):
 SELECT TINDEX_ID_STORAGE_FORMAT FROM information_schema.PARTITION_INDEXES
   WHERE ... AND index_name='PRIMARY';
+SELECT LPAD(HEX(TINDEX_ID),8,'0') FROM information_schema.PARTITIONS_VERBOSE
+  WHERE table_schema='<db>' AND table_name='<table>' AND partition_name='<part>';
 
--- Get encoded key for MAX(pk)
+-- Get encoded split key.
+-- With a PRIMARY KEY — encode the MAX(pk) row:
 SELECT SUBSTRING_INDEX(SUBSTRING_INDEX(MYROCK_ENCODE(),';',1),':',-1)
   FROM <db>.<table> FORCE INDEX(PRIMARY) WHERE <pk> = MAX(<pk>);
+-- Without a PRIMARY KEY — take the largest encoded clustered key (no index hint):
+SELECT SUBSTRING_INDEX(SUBSTRING_INDEX(MYROCK_ENCODE(),';',1),':',-1) AS k
+  FROM <db>.<table> ORDER BY k DESC LIMIT 1;
 
 -- split_key = prefix + encoded_key
 -- Split the region
@@ -579,20 +590,21 @@ therefore:
 CALL dbms_admin.flush_route();
 ```
 
-After this, all subsequent inserts with `pk > MAX(pk)` at split time go to the new node.
+After this, all subsequent inserts whose key exceeds the split key go to the new node.
 
 ### Information Schema Tables Used
 
 | Table | Purpose |
 |-------|---------|
 | `information_schema.meta_cluster_nodes` | List all cluster node names |
-| `information_schema.META_CLUSTER_TABLE_LOCATION` | Table → RG → leader node mapping |
+| `information_schema.META_CLUSTER_TABLE_LOCATION` | Table → RG → leader node mapping (table-level view) |
 | `information_schema.META_CLUSTER_REGIONS` | Region → RG mapping, start/end keys |
 | `information_schema.META_CLUSTER_RGS` | RG members, leader, quorum |
 | `information_schema.TDSTORE_RANGE_BLOCK_INFO` | Range block boundaries within regions |
 | `information_schema.tables` | `tindex_id` for non-partitioned tables |
-| `information_schema.PARTITION_INDEXES` | `TINDEX_ID_STORAGE_FORMAT` for partitioned tables |
-| `INFORMATION_SCHEMA.STATISTICS` | Primary key column names |
+| `information_schema.PARTITION_INDEXES` | `TINDEX_ID_STORAGE_FORMAT` for partitioned tables (PRIMARY index) |
+| `INFORMATION_SCHEMA.PARTITIONS_VERBOSE` | Partition `TINDEX_ID` (regions + no-PK storage prefix) |
+| `INFORMATION_SCHEMA.STATISTICS` | Primary key column name (optional; tables may have none) |
 
 ### SQL Commands Used
 
@@ -607,23 +619,52 @@ After this, all subsequent inserts with `pk > MAX(pk)` at split time go to the n
 
 ### Implementation
 
+The command is a thin dispatcher (`isqlm/placement`) over small, single-purpose
+helpers grouped below.
+
+**Dispatch & shared helpers**
+
 | Function | Description |
 |----------|-------------|
-| `isqlm/placement` | Meta command entry point |
+| `isqlm/placement` | Entry point: dispatch view / change / usage (no args) |
 | `isqlm--placement-parse-target` | Parse `[db.]table[.partition]` string |
-| `isqlm--placement-show-info` | Query `META_CLUSTER_TABLE_LOCATION` and display |
-| `isqlm--placement-get-nodes` | Query `meta_cluster_nodes` |
 | `isqlm--placement-resolve-node` | Resolve node hint (exact/index/suffix) |
-| `isqlm--placement-get-region-info` | Get region_id, rg_id from `META_CLUSTER_REGIONS` |
-| `isqlm--placement-get-pk-col` | Get PRIMARY KEY column from `STATISTICS` |
-| `isqlm--placement-get-storage-prefix` | Get hex prefix from `tindex_id` or `PARTITION_INDEXES` |
-| `isqlm--placement-get-encode-key` | Encode key via `MYROCK_ENCODE()` |
+| `isqlm--placement-get-nodes` | Query `meta_cluster_nodes` |
+| `isqlm--placement-usage` | Print usage + list available nodes |
+| `isqlm--placement-query-rows` / `-query-scalar` | Run SQL, return rows / first scalar |
+| `isqlm--placement-poll` | Generic cancellable poll loop (`sit-for`) |
+
+**View / metadata**
+
+| Function | Description |
+|----------|-------------|
+| `isqlm--placement-show-info` | Show RG → leader; partition-level resolves RGs via the partition's own regions |
+| `isqlm--placement-get-region-info` | Get region_id, rg_id, start/end keys from `META_CLUSTER_REGIONS` |
+| `isqlm--placement-rg-leader` | Get an RG's current leader node |
+| `isqlm--placement-get-pk-col` | Get PRIMARY KEY column from `STATISTICS` (nil if none) |
+| `isqlm--placement-get-storage-prefix` | Hex prefix from `tindex_id` / `PARTITION_INDEXES` / `PARTITIONS_VERBOSE` |
+| `isqlm--placement-get-encode-key` | Encode the MAX(pk) row via `MYROCK_ENCODE()` |
+| `isqlm--placement-get-max-encoded-key` | Largest encoded clustered key (no-PK tables) |
+| `isqlm--placement-compute-split-key` | Pick split key (MAX(pk) or max clustered key) + display label |
+
+**Change steps**
+
+| Function | Description |
+|----------|-------------|
+| `isqlm--placement-change` | Orchestrate the change: validate → split key → region → RG → leader → flush |
+| `isqlm--placement-find-region-for-key` | Find the region whose range contains the split key |
+| `isqlm--placement-region-already-split` | Detect a prior split at the same key |
 | `isqlm--placement-split-range-block` | Step 0: split range block + poll |
 | `isqlm--placement-split-region-sql` | Step 1: `ALTER INSTANCE SPLIT REGION` |
+| `isqlm--placement-wait-region-split` | Step 1: poll until the new region appears |
+| `isqlm--placement-do-region-split` | Step 0+1 combined (range block + region + wait) |
+| `isqlm--placement-split-rg` | Step 2: `ALTER INSTANCE SPLIT RG` |
+| `isqlm--placement-find-new-rg` | Identify the RG created by the split |
+| `isqlm--placement-split-rg-and-place` | Step 2+3: split RG then place its leader |
+| `isqlm--placement-place-rg-leader` | Step 3: wait-for-working → optional `MIGRATE` → retry `TRANSFER LEADER` until leader confirmed |
 | `isqlm--placement-rg-has-node` | Check whether an RG already has a replica on a node |
 | `isqlm--placement-wait-rg-working` | Poll `rep_group_state` until `L_Working` |
 | `isqlm--placement-rg-leader-is` | Check whether an RG's leader is a given node |
-| `isqlm--placement-place-rg-leader` | Step 3: wait-for-working → optional `MIGRATE` → retry `TRANSFER LEADER` until leader confirmed on target |
 
 ### Examples
 
@@ -631,7 +672,7 @@ After this, all subsequent inserts with `pk > MAX(pk)` at split time go to the n
 SQL> \placement
 Usage:
   \placement [db.]table[.partition]         show current node
-  \placement [db.]table[.partition] NODE    split + migrate
+  \placement [db.]table[.partition] NODE    split + place leader
 
 Available nodes:
   [0] node-1-002

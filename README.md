@@ -413,7 +413,7 @@ Each column becomes a variable named `PREFIX` + column name. The query must retu
 
 ### Node Placement (`\placement`) — TDSQL 3
 
-View which node a table/partition is on, or split its region so future inserts go to a new node.  The table must have a PRIMARY KEY.
+View which node a table/partition is on, or split its region so future inserts go to a new node.  A PRIMARY KEY is **not** required — with one the split point is the encoded `MAX(pk)`, otherwise it is the table's largest encoded clustered key.
 
 **List available nodes:**
 
@@ -456,9 +456,12 @@ test.t2:
 
 After this, inserts with `a > 51190` go to `node-1-001`.
 
-**Partition support** — use `db.table.partition` syntax:
+**Partition support** — use `db.table.partition` syntax.  Placement is resolved per partition (each partition reports only its own RGs):
 
 ```
+SQL> \placement test.t2.p0
+test.t2.p0:
+  RG 95067 → node-1-002
 SQL> \placement test.t2.p0 node-1-001
 ```
 
