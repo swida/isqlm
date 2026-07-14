@@ -194,7 +194,7 @@ This expansion happens after statement splitting and before `isqlm--execute-sql`
 | `\ef [NAME[(types)]]` | `isqlm/ef` | Edit function/procedure definition |
 | `\eval` | `isqlm/eval` | Evaluate arbitrary Elisp expression |
 | `\echo` | `isqlm/echo` | Output text with variable expansion |
-| `\for` | `isqlm--for-start` | Loop over values with `{ body }` |
+| `\for` | `isqlm--for-start` | Loop over literal values, an Elisp list, or a `{SQL}` query result, with `{ body }` |
 | `\if` | `isqlm/if` | Begin conditional block |
 | `\elif` | `isqlm/elif` | Else-if branch |
 | `\else` | `isqlm/else` | Else branch |
@@ -248,7 +248,7 @@ Inspired by PostgreSQL's `psql` meta-commands. Uses a stack-based approach:
 - Falsy literals: `"0"`, `"false"`, `"no"`, `"nil"`, `""`, `"off"`
 - Everything else is truthy
 
-## 4.2 For Loops (`\for VAR in V1 V2 ... { body }`)
+## 4.2 For Loops (`\for VAR in VALUE-SOURCE { body }`)
 
 **State**: `isqlm-for-stack` — a stack of plists, each with:
 - `:var` — loop variable symbol
@@ -257,15 +257,59 @@ Inspired by PostgreSQL's `psql` meta-commands. Uses a stack-based approach:
 - `:brace` — whether the opening `{` has been seen
 - `:depth` — nested `{}` depth counter
 
-**Three syntax forms**:
+**Loop variable binding** — `isqlm-for-bindings`: an alist of `(SYMBOL . VALUE)`
+holding the currently active loop bindings. Loop variables are bound **here**,
+not via `set`, for two reasons:
+1. Names that are Emacs Lisp constants (`t`, `nil`) can be used as loop
+   variables (e.g. `\for t in ...`) — `(set 't ...)` would signal
+   `setting-constant`.
+2. The global namespace is not polluted.
+
+Both `isqlm--expand-arg` (command args) and `isqlm--expand-sql-variables` (SQL)
+consult `isqlm-for-bindings` **before** falling back to `symbol-value`. Inside
+SQL, a loop variable **always expands as raw text** (like `::var`), since loop
+values are substitution tokens (typically identifiers such as table names).
+This makes `analyze table :t` expand to `analyze table orders`, not
+`analyze table 'orders'`.
+
+**Value sources** (parsed by `isqlm--for-parse-values`):
+1. **Literal list**: `\for i in 1 2 3 { ... }` — whitespace-separated values
+   (each passed through `isqlm--expand-arg`)
+2. **Elisp expression**: `\for i in (number-sequence 1 10) { ... }` — the
+   parenthesised form is read with `read-from-string` and evaluated; the result
+   list supplies the values
+3. **SQL query** (Eshell-style command substitution): `\for t in {SELECT ...} { ... }`
+   — the SQL between the braces is executed via `isqlm-execute-string`, and the
+   **first column** of each returned row supplies the values. A trailing `;`
+   inside the braces is stripped. The source must be a `SELECT`.
+
+The value-source braces `{SQL}` are distinguished from the body braces `{ body }`
+by `isqlm--for-find-matching-brace`, a quote/backtick-aware scanner that finds the
+`}` matching the opening `{`, ignoring braces inside SQL string/identifier
+literals and handling nesting.
+
+**Three body forms** (dispatched by `isqlm--for-dispatch-body`):
 1. **Inline**: `\for db in a b { \u :db; show tables; }` — parsed and executed immediately
 2. **Brace on same line**: `\for i in 1 2 3 {` — body collected on subsequent lines until `}`
 3. **Brace on next line**: `\for i in 1 2 3` → `{` → body → `}`
 
+**Examples**:
+
+```
+SQL> \for t in {select table_name from information_schema.tables
+  ->   where table_schema = 'sqlsmith_test';} { analyze table :t; }
+```
+
+iterates over every table name returned by the query, running
+`analyze table <name>` for each.
+
 **Processing in `isqlm-send-input`**:
-- `\for` detection pushes a frame onto `isqlm-for-stack`
+- `\for` detection calls `isqlm--for-start`, which parses `VAR in`, resolves the
+  value source, and dispatches the body
 - While `isqlm--for-collecting-p` is true, all input lines are diverted to `isqlm--for-collect-line`
-- On `}`, `isqlm--for-execute-body` iterates: for each value, binds the variable with `set`, then processes each body line (dispatching `\` commands or executing SQL with variable expansion)
+- On `}`, `isqlm--for-execute-body` iterates: for each value, binds the variable
+  in `isqlm-for-bindings`, then processes each body line (dispatching `\`
+  commands or executing SQL with variable expansion)
 
 **Inline parsing**: the body string between `{` and `}` is split on `;`. Non-command lines without terminators get `;` auto-appended.
 
@@ -1130,6 +1174,7 @@ emacs -batch -l isqlm.el -l isqlm-test.el -f ert-run-tests-batch-and-exit
 | Conditional Flow — Scripts | `isqlm-test-script-if-else`, `isqlm-test-script-if-elisp-varref` | Regression tests: `\if`/`\else` in `isqlm--execute-script`, `:varname` expansion inside Elisp conditions in scripts |
 | Command Parsing | `isqlm-test-parse-command-line` | Tokenization with double-quoted strings |
 | Variable Expansion | `isqlm-test-expand-arg`, `isqlm-test-expand-sql-variables`, `isqlm-test-expand-expr-variables` | `:varname` argument expansion, SQL `:var`/`::var` expansion (quoting, escaping, NULL, inside-string immunity), Elisp expression `:varname` expansion |
+| For Loops | `isqlm-test-for-find-matching-brace`, `isqlm-test-for-loop-var-expansion`, `isqlm-test-for-parse-values` | Quote/backtick-aware brace matching, loop-var binding via `isqlm-for-bindings` (incl. constant `t`) with raw SQL expansion, value-source parsing for literal/Elisp/`{SQL}` forms |
 | Command Aliases | `isqlm-test-command-aliases` | Alias alist entries (`?`→`help`, `h`→`help`, `q`→`quit`, `u`→`use`, `.`→`i`) |
 | Conditional Detection | `isqlm-test-cond-flow-command-p` | `isqlm--cond-flow-command-p` correctly identifies `\if`/`\elif`/`\else`/`\endif` and rejects others |
 | Display Width | `isqlm-test-display-width` | Multi-line string width calculation for table rendering |

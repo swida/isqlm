@@ -21,6 +21,7 @@ Sets up markers and variables without requiring mysql-el module."
            (isqlm-pending-input "")
            (isqlm-cond-stack nil)
            (isqlm-for-stack nil)
+           (isqlm-for-bindings nil)
            (isqlm-history-ring (make-ring 64))
            (isqlm-history-index nil)
            (isqlm-input-saved nil)
@@ -332,6 +333,56 @@ Regression test: :varname was not expanded before eval."
   (isqlm-test-with-dynvars ((isqlm-test-null nil))
     (should (equal (isqlm--expand-sql-variables "SET x = :isqlm-test-null")
                    "SET x = NULL"))))
+
+(ert-deftest isqlm-test-for-find-matching-brace ()
+  "Test brace matching for \\for value/body source parsing."
+  ;; simple
+  (should (= (isqlm--for-find-matching-brace "{abc}" 0) 4))
+  ;; nested
+  (should (= (isqlm--for-find-matching-brace "{a{b}c}" 0) 6))
+  ;; braces inside single-quoted string are ignored
+  (should (= (isqlm--for-find-matching-brace "{sel '}' x}" 0) 10))
+  ;; braces inside backticks ignored
+  (should (= (isqlm--for-find-matching-brace "{`a}b` c}" 0) 8))
+  ;; unterminated
+  (should (null (isqlm--for-find-matching-brace "{abc" 0))))
+
+(ert-deftest isqlm-test-for-loop-var-expansion ()
+  "Loop-bound vars resolve via `isqlm-for-bindings' and expand raw in SQL.
+Also verifies that constant names like `t' can be used as loop vars."
+  (isqlm-test-with-buffer
+    (setf (alist-get 't isqlm-for-bindings) "sqlsmith_test_t1")
+    ;; :t in SQL expands raw (no quoting), even for the constant `t'
+    (should (equal (isqlm--expand-sql-variables "analyze table :t")
+                   "analyze table sqlsmith_test_t1"))
+    ;; ::t also raw
+    (should (equal (isqlm--expand-sql-variables "analyze table ::t")
+                   "analyze table sqlsmith_test_t1"))
+    ;; :t as a command argument expands to the raw value
+    (should (equal (isqlm--expand-arg ":t") "sqlsmith_test_t1"))))
+
+(ert-deftest isqlm-test-for-parse-values ()
+  "Test parsing of the value source and body-spec in \\for."
+  (isqlm-test-with-buffer
+    ;; literal values, inline body
+    (let ((r (isqlm--for-parse-values "a b c { select :x; }")))
+      (should (equal (car r) '("a" "b" "c")))
+      (should (equal (cdr r) "{ select :x; }")))
+    ;; elisp source
+    (let ((r (isqlm--for-parse-values "(list 1 2 3) { select :x; }")))
+      (should (equal (car r) '("1" "2" "3")))
+      (should (equal (cdr r) "{ select :x; }")))
+    ;; {SQL} source — stub isqlm-execute-string
+    (cl-letf (((symbol-function 'isqlm-execute-string)
+               (lambda (sql)
+                 (should (equal sql
+                                "select table_name from information_schema.tables"))
+                 '(:type select :columns ("table_name")
+                         :rows (("t1") ("t2"))))))
+      (let ((r (isqlm--for-parse-values
+                "{select table_name from information_schema.tables;} { analyze table :t; }")))
+        (should (equal (car r) '("t1" "t2")))
+        (should (equal (cdr r) "{ analyze table :t; }"))))))
 
 (ert-deftest isqlm-test-expand-expr-variables ()
   "Test :varname expansion inside Elisp expression strings."

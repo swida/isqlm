@@ -184,6 +184,16 @@ Each element is a plist (:satisfied BOOL :active BOOL :depth-skip INT).
 :body     — list of body lines collected so far (in reverse)
 :brace    — whether we've seen the opening `{' yet")
 
+(defvar-local isqlm-for-bindings nil
+  "Alist of active \\for loop variable bindings: (SYMBOL . VALUE).
+Loop variables are bound here instead of via `set' so that names
+which are Emacs Lisp constants (`t', `nil') can be used, and so the
+global namespace is not polluted.  Both `isqlm--expand-arg' and
+`isqlm--expand-sql-variables' consult this alist before falling back
+to `symbol-value'.  Inside SQL, loop variables always expand as raw
+text (like `::var'), since loop values are substitution tokens
+\(e.g. table names).")
+
 (defvar-local isqlm--async-state nil
   "Non-nil when an asynchronous query is in progress.
 Plist with keys:
@@ -822,14 +832,17 @@ backtick identifiers, and comments.  Variable values are formatted as:
                                 (= c ?_) (= c ?-))))
                 (cl-incf j))
               (let* ((name (substring sql start j))
+                     (binding (assq (intern name) isqlm-for-bindings))
+                     (loop-var-p (and binding t))
                      (sym (intern-soft name))
-                     (val (if (and sym (boundp sym))
-                              (symbol-value sym)
-                            (user-error "Void variable in SQL: %s%s"
-                                        (if raw-p "::" ":") name)))
+                     (val (cond
+                           (binding (cdr binding))
+                           ((and sym (boundp sym)) (symbol-value sym))
+                           (t (user-error "Void variable in SQL: %s%s"
+                                          (if raw-p "::" ":") name))))
                      (replacement
-                      (if raw-p
-                          ;; Raw: no quoting
+                      (if (or raw-p loop-var-p)
+                          ;; Raw: no quoting (identifiers, or \for loop vars)
                           (cond
                            ((null val) "NULL")
                            ((stringp val) val)
@@ -3826,82 +3839,165 @@ The last query must have returned exactly one row."
   "Return non-nil if we are currently collecting for-loop body lines."
   (and isqlm-for-stack (plist-get (car isqlm-for-stack) :brace)))
 
-(defun isqlm--for-start (input)
-  "Parse `\\for var in val1 val2 ...' and push a for-loop frame.
-INPUT is the full line.  Supports three forms:
-  \\for VAR in V1 V2 { body lines... }  — inline (single line)
-  \\for VAR in V1 V2 {                  — brace on same line, body follows
-  \\for VAR in V1 V2                    — brace expected on next line
-Values can also be an Elisp expression: \\for i in (number-sequence 1 10) { ... }"
-  (let* ((trimmed (string-trim input))
-         (after-for (string-trim (substring trimmed (length "\\for"))))
-         (brace-open (string-match "{" after-for))
-         (brace-close (and brace-open (string-match "}[[:space:]]*$" after-for)))
-         (header (string-trim (if brace-open
-                                  (substring after-for 0 brace-open)
-                                after-for)))
-         (header-parts (isqlm--parse-command-line header))
-         (var-name (nth 0 header-parts))
-         (in-kw (nth 1 header-parts))
-         (values-raw (nthcdr 2 header-parts)))
-    (if (not (and var-name in-kw (string= (downcase in-kw) "in") values-raw))
-        (isqlm--output-error "Usage: \\for VAR in VAL1 VAL2 ... { body }\n")
-      ;; Resolve values
-      (let* ((values-str (string-trim
-                          (substring header
-                                     (+ (length var-name) 1 (length in-kw) 1))))
-             (values
-              (if (string-prefix-p "(" values-str)
-                  (condition-case err
-                      (let ((result (eval (read values-str) t)))
-                        (mapcar (lambda (v)
-                                  (if (stringp v) v (format "%s" v)))
-                                (if (listp result) result (list result))))
-                    (error
-                     (isqlm--output-error
-                      (format "*** Eval Error in \\for values *** %s\n"
-                              (isqlm--error-message err)))
-                     nil))
-                (mapcar (lambda (v)
-                          (let ((expanded (isqlm--expand-arg v)))
-                            (if (stringp expanded) expanded
-                              (format "%s" expanded))))
-                        values-raw))))
-        (when values
+(defun isqlm--for-find-matching-brace (str start)
+  "Return index of the `}' matching the `{' at START in STR, or nil.
+Tracks single quotes, double quotes and backticks so that braces
+inside SQL string/identifier literals are ignored, and handles
+nested braces."
+  (let ((i (1+ start)) (len (length str)) (depth 1) (in-quote nil) result)
+    (while (and (< i len) (not result))
+      (let ((ch (aref str i)))
+        (cond
+         (in-quote
           (cond
-           ;; Inline: { body } all on one line
-           ((and brace-open brace-close)
-            (let* ((body-str (string-trim
-                              (substring after-for (1+ brace-open)
-                                         (match-beginning 0))))
-                   (body-lines (split-string body-str ";" t "[ \t\n]+")))
-              (setq body-lines
-                    (mapcar (lambda (l)
-                              (let ((s (string-trim l)))
-                                (if (and (> (length s) 0)
-                                         (not (string-prefix-p "\\" s))
-                                         (not (string-suffix-p ";" s))
-                                         (not (string-suffix-p "\\G" s)))
-                                    (concat s ";")
-                                  s)))
-                            body-lines))
-              (isqlm--for-execute-body (intern var-name) values body-lines)))
-           ;; Brace on same line, body follows on subsequent lines
-           (brace-open
-            (push (list :var (intern var-name)
-                        :values values
-                        :body nil
-                        :brace t
-                        :depth 0)
-                  isqlm-for-stack))
-           ;; No brace yet, expect { on next line
-           (t
-            (push (list :var (intern var-name)
-                        :values values
-                        :body nil
-                        :brace nil
-                        :depth 0)
-                  isqlm-for-stack))))))))
+           ;; backslash escape inside quotes
+           ((and (eq ch ?\\) (< (1+ i) len)) (setq i (1+ i)))
+           ((eq ch in-quote) (setq in-quote nil))))
+         ((memq ch '(?\' ?\" ?\`)) (setq in-quote ch))
+         ((eq ch ?{) (setq depth (1+ depth)))
+         ((eq ch ?})
+          (setq depth (1- depth))
+          (when (= depth 0) (setq result i)))))
+      (setq i (1+ i)))
+    result))
+
+(defun isqlm--for-sql-values (sql)
+  "Execute SQL and return the first column of each row as a list of strings.
+Used by the `\\for VAR in {SQL} { body }' form (Eshell-style command
+substitution).  Returns nil on error or when there is no result set."
+  (let* ((stripped (string-trim sql))
+         (stripped (if (string-suffix-p ";" stripped)
+                       (string-trim (substring stripped 0 -1))
+                     stripped))
+         (result (condition-case err
+                     (isqlm-execute-string stripped)
+                   (error
+                    (isqlm--output-error
+                     (format "*** SQL Error in \\for *** %s\n"
+                             (isqlm--error-message err)))
+                    'error))))
+    (cond
+     ((eq result 'error) nil)
+     ((and result (eq (plist-get result :type) 'select))
+      (mapcar (lambda (row)
+                (let ((v (car row)))
+                  (if (stringp v) v (format "%s" v))))
+              (plist-get result :rows)))
+     (t
+      (isqlm--output-error "\\for: {SQL} source must be a SELECT query\n")
+      nil))))
+
+(defun isqlm--for-parse-values (rest)
+  "Parse the value source at the start of REST (text after `VAR in ').
+Return a cons (VALUES . BODY-SPEC) where VALUES is the resolved list of
+value strings and BODY-SPEC is the remaining string (the loop body,
+starting at its `{' or empty).  Three value-source forms are supported:
+  {SQL}       — run SQL, use the first column of each row (Eshell-style)
+  (elisp)     — evaluate an Elisp expression yielding a list
+  v1 v2 ...   — literal whitespace-separated values"
+  (cond
+   ;; {SQL} command-substitution source
+   ((string-prefix-p "{" rest)
+    (let ((close (isqlm--for-find-matching-brace rest 0)))
+      (if (not close)
+          (progn
+            (isqlm--output-error "\\for: unterminated `{' in value source\n")
+            (cons nil ""))
+        (let ((sql (substring rest 1 close))
+              (body-spec (string-trim (substring rest (1+ close)))))
+          (cons (isqlm--for-sql-values sql) body-spec)))))
+   ;; (elisp) expression source
+   ((string-prefix-p "(" rest)
+    (condition-case err
+        (let* ((read-result (read-from-string rest))
+               (expr (car read-result))
+               (end (cdr read-result))
+               (body-spec (string-trim (substring rest end)))
+               (result (eval expr t)))
+          (cons (mapcar (lambda (v) (if (stringp v) v (format "%s" v)))
+                        (if (listp result) result (list result)))
+                body-spec))
+      (error
+       (isqlm--output-error
+        (format "*** Eval Error in \\for values *** %s\n"
+                (isqlm--error-message err)))
+       (cons nil ""))))
+   ;; literal whitespace-separated values
+   (t
+    (let* ((brace-open (string-match "{" rest))
+           (values-str (string-trim (if brace-open
+                                        (substring rest 0 brace-open)
+                                      rest)))
+           (body-spec (if brace-open (string-trim (substring rest brace-open)) ""))
+           (values (mapcar (lambda (v)
+                             (let ((expanded (isqlm--expand-arg v)))
+                               (if (stringp expanded) expanded
+                                 (format "%s" expanded))))
+                           (isqlm--parse-command-line values-str))))
+      (cons values body-spec)))))
+
+(defun isqlm--for-start (input)
+  "Parse `\\for var in VALUE-SOURCE { body }' and push a for-loop frame.
+INPUT is the full line.  The value source may be a list of literal
+values, an Elisp expression `(...)', or a SQL query `{...}' whose first
+column supplies the values (Eshell-style command substitution).  The
+body may take three forms:
+  \\for VAR in SRC { body lines... }  — inline (single line)
+  \\for VAR in SRC {                  — brace on same line, body follows
+  \\for VAR in SRC                    — brace expected on next line
+Examples:
+  \\for i in 1 2 3 { select :i; }
+  \\for i in (number-sequence 1 10) { select :i; }
+  \\for t in {select table_name from information_schema.tables;} \
+      { analyze table :t; }"
+  (let* ((trimmed (string-trim input))
+         (after-for (string-trim (substring trimmed (length "\\for")))))
+    (if (not (let ((case-fold-search t))
+               (string-match "\\`\\([^ \t]+\\)[ \t]+in\\(?:[ \t]+\\|\\'\\)"
+                             after-for)))
+        (isqlm--output-error "Usage: \\for VAR in VALUE-SOURCE { body }\n")
+      (let* ((var-name (match-string 1 after-for))
+             (rest (substring after-for (match-end 0)))
+             (parsed (isqlm--for-parse-values rest))
+             (values (car parsed))
+             (body-spec (cdr parsed)))
+        (when values
+          (isqlm--for-dispatch-body (intern var-name) values body-spec))))))
+
+(defun isqlm--for-dispatch-body (var values body-spec)
+  "Dispatch the loop body given VAR, VALUES and BODY-SPEC.
+BODY-SPEC is the text following the value source (starting at its `{'
+or empty).  Handles inline `{ ... }', a same-line opening `{', or an
+empty spec (brace expected on the next line)."
+  (let* ((brace-open (and (> (length body-spec) 0)
+                          (string-prefix-p "{" body-spec)))
+         (brace-close (and brace-open
+                           (string-match "}[[:space:]]*\\'" body-spec))))
+    (cond
+     ;; Inline: { body } all on one line
+     ((and brace-open brace-close)
+      (let* ((body-str (string-trim
+                        (substring body-spec 1 (match-beginning 0))))
+             (body-lines (split-string body-str ";" t "[ \t\n]+")))
+        (setq body-lines
+              (mapcar (lambda (l)
+                        (let ((s (string-trim l)))
+                          (if (and (> (length s) 0)
+                                   (not (string-prefix-p "\\" s))
+                                   (not (string-suffix-p ";" s))
+                                   (not (string-suffix-p "\\G" s)))
+                              (concat s ";")
+                            s)))
+                      body-lines))
+        (isqlm--for-execute-body var values body-lines)))
+     ;; Brace on same line, body follows on subsequent lines
+     (brace-open
+      (push (list :var var :values values :body nil :brace t :depth 0)
+            isqlm-for-stack))
+     ;; No brace yet, expect { on next line
+     (t
+      (push (list :var var :values values :body nil :brace nil :depth 0)
+            isqlm-for-stack)))))
 (defun isqlm--for-collect-line (input)
   "Collect INPUT as a body line for the current for-loop.
 Handle nested { } and detect the closing }."
@@ -3942,10 +4038,12 @@ Each line is executed asynchronously via `isqlm--execute-line'."
   (isqlm--for-iterate var values body))
 
 (defun isqlm--for-iterate (var values body)
-  "Iterate: bind VAR to (car VALUES), run BODY lines, then recurse."
+  "Iterate: bind VAR to (car VALUES), run BODY lines, then recurse.
+VAR is bound in `isqlm-for-bindings' (not via `set') so that constant
+names such as `t'/`nil' work and the global namespace stays clean."
   (if (null values)
       nil  ; done
-    (set var (car values))
+    (setf (alist-get var isqlm-for-bindings) (car values))
     (isqlm--for-run-lines
      body var (cdr values) body)))
 
@@ -4033,13 +4131,18 @@ E.g. \\? and \\h both map to \\help.")
 
 (defun isqlm--expand-arg (arg)
   "Expand ARG: if it starts with `:' treat as a variable reference.
-`:varname' expands to the value of varname.  Otherwise return ARG
-as-is (with numeric coercion)."
+`:varname' expands to the value of varname.  Active `\\for' loop
+bindings (in `isqlm-for-bindings') take precedence over global
+variables.  Otherwise return ARG as-is (with numeric coercion)."
   (if (and (stringp arg) (string-prefix-p ":" arg) (> (length arg) 1))
-      (let ((sym (intern-soft (substring arg 1))))
-        (if (and sym (boundp sym))
-            (symbol-value sym)
-          (user-error "Void variable: %s" (substring arg 1))))
+      (let* ((name (substring arg 1))
+             (binding (assq (intern name) isqlm-for-bindings)))
+        (if binding
+            (cdr binding)
+          (let ((sym (intern-soft name)))
+            (if (and sym (boundp sym))
+                (symbol-value sym)
+              (user-error "Void variable: %s" name)))))
     (isqlm--try-numeric arg)))
 
 (defun isqlm--parse-command-line (str)
