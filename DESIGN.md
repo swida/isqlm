@@ -277,7 +277,21 @@ This makes `analyze table :t` expand to `analyze table orders`, not
    (each passed through `isqlm--expand-arg`)
 2. **Elisp expression**: `\for i in (number-sequence 1 10) { ... }` — the
    parenthesised form is read with `read-from-string` and evaluated; the result
-   list supplies the values
+   list supplies the values. Any expression returning a list works, including
+   one that runs a query with `isqlm-execute-string` and extracts a column —
+   e.g. the following pulls the first column out of a result set:
+
+   ```
+   \for v in (mapcar #'car
+                     (plist-get (isqlm-execute-string "SELECT ...") :rows))
+       { ... :v ... }
+   ```
+
+   Use `(nth N row)` instead of `#'car` to pick a different column. Note that
+   `isqlm-execute-string` **returns** a result plist, whereas display helpers
+   like `isqlm--quick-sql` only print to the buffer and must not be used here.
+   For the common "iterate over a column" case the `{SQL}` form below is more
+   concise.
 3. **SQL query** (Eshell-style command substitution): `\for t in {SELECT ...} { ... }`
    — the SQL between the braces is executed via `isqlm-execute-string`, and the
    **first column** of each returned row supplies the values. A trailing `;`
@@ -302,6 +316,17 @@ SQL> \for t in {select table_name from information_schema.tables
 
 iterates over every table name returned by the query, running
 `analyze table <name>` for each.
+
+The same result via the Elisp form (useful when you need to post-process the
+values or pick a non-first column):
+
+```
+SQL> \for t in (mapcar #'car
+  ->            (plist-get (isqlm-execute-string
+  ->              "select table_name from information_schema.tables
+  ->               where table_schema = 'sqlsmith_test'") :rows))
+  ->   { analyze table :t; }
+```
 
 **Processing in `isqlm-send-input`**:
 - `\for` detection calls `isqlm--for-start`, which parses `VAR in`, resolves the
