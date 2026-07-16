@@ -529,7 +529,7 @@ INSERT INTO `t3` (`a`, `b`, `c`) VALUES
 
 3. **Column parsing** (`isqlm--genddl-parse-columns-from-ddl`): Extracts column name/type pairs from the real DDL for DML generation.
 
-4. **Real data fetch** (`isqlm--genddl-fetch-data`): Issues `SELECT ... LIMIT 2` to get actual rows. Values are formatted type-aware via `isqlm--genddl-format-value` — numeric types (`int`, `decimal`, etc.) are unquoted, strings are single-quoted with proper escaping, NULLs output as `NULL`. If the table is empty, no INSERT statement is generated.
+4. **Real data fetch** (`isqlm--genddl-fetch-data`): Issues `SELECT ... [LIMIT N]` to get actual rows, dumping **all** rows by default so the reproduction is faithful (window/aggregate queries depend on the full data set). The row cap is controlled by `isqlm-genddl-max-rows` (default `1000`; `0` = unlimited, no `LIMIT` clause). Values are formatted type-aware via `isqlm--genddl-format-value` — numeric types (`int`, `decimal`, etc.) are unquoted, strings are single-quoted with proper escaping, NULLs output as `NULL`. If the table is empty, no INSERT statement is generated.
 
 **Implementation**:
 
@@ -1094,6 +1094,7 @@ All options belong to the `isqlm` customize group:
 | `isqlm-auto-reconnect` | `t` | Auto-reconnect on connection loss |
 | `isqlm-max-column-width` | `0` | Max column width (0 = auto/window width) |
 | `isqlm-max-rows` | `1000` | Max rows displayed |
+| `isqlm-genddl-max-rows` | `1000` | Max data rows `\genddl` dumps per table (0 = unlimited) |
 | `isqlm-null-string` | `"NULL"` | Display string for NULL |
 
 ## 11. Faces

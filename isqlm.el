@@ -113,6 +113,13 @@ up to the current window width minus table borders."
 (defcustom isqlm-null-string "NULL"
   "String for SQL NULL values." :type 'string :group 'isqlm)
 
+(defcustom isqlm-genddl-max-rows 1000
+  "Maximum number of data rows `\\genddl' dumps per table.  0 = unlimited.
+`\\genddl' generates INSERT statements from the table's real rows so the
+reproduction is faithful (e.g. window functions depend on all rows).  This
+caps the dump size for large tables."
+  :type 'integer :group 'isqlm)
+
 (defcustom isqlm-mode-hook nil
   "Hook run when entering `isqlm-mode'."
   :type 'hook :group 'isqlm)
@@ -3025,15 +3032,19 @@ Numbers are unquoted, strings are single-quoted, NULL stays NULL."
 
 (defun isqlm--genddl-fetch-data (tbl-name col-types &optional num-rows)
   "Fetch real data from TBL-NAME and format as INSERT INTO statement.
-COL-TYPES is a list of (NAME . TYPE).  NUM-ROWS defaults to 2.
+COL-TYPES is a list of (NAME . TYPE).  NUM-ROWS overrides the row cap;
+when nil it defaults to `isqlm-genddl-max-rows' (0 = no LIMIT, dump all).
 Returns the INSERT statement string, or nil if the table is empty."
-  (let ((num-rows (or num-rows 2)))
+  (let ((num-rows (or num-rows isqlm-genddl-max-rows)))
     (condition-case nil
         (let* ((col-names (mapcar #'car col-types))
-               (sql (format "SELECT %s FROM `%s` LIMIT %d"
+               (sql (format "SELECT %s FROM `%s`%s"
                             (mapconcat (lambda (c) (format "`%s`" c))
                                        col-names ", ")
-                            tbl-name num-rows))
+                            tbl-name
+                            (if (and num-rows (> num-rows 0))
+                                (format " LIMIT %d" num-rows)
+                              "")))
                (result (isqlm-execute-string sql))
                (rows (plist-get result :rows)))
           (when (and rows (> (length rows) 0))
