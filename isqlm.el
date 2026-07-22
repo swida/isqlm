@@ -1961,20 +1961,38 @@ Without argument, returns \";\" to reset."
   "Process LINES from a script with PENDING accumulated input in BUF.
 Async: when a SQL statement is found, execute it and continue
 processing remaining lines in the callback.
-Recognizes DELIMITER directives (MySQL CLI compatible)."
-  (if (null lines)
-      ;; End of script — check for unterminated input
-      (when (> (length (string-trim pending)) 0)
-        (when (buffer-live-p buf)
-          (with-current-buffer buf
-            (when (isqlm--cond-active-p)
-              (isqlm--output-error
-               (format "Unterminated statement at end of script: %s\n"
-                       (string-trim pending)))))))
-    (let* ((line (car lines))
-           (rest (cdr lines))
-           (line-trimmed (string-trim line)))
-      (when (buffer-live-p buf)
+Recognizes DELIMITER directives (MySQL CLI compatible).
+
+Synchronous cases (DELIMITER, conditional-flow, skipped lines, and
+accumulating an incomplete statement) are handled in an iterative loop
+rather than by self-recursion, so a single statement spanning thousands
+of lines does not overflow the Lisp stack (`excessive-lisp-nesting').
+Only genuinely asynchronous execution defers to a callback (which runs
+on a fresh stack via a timer)."
+  (catch 'isqlm--script-done
+    (while t
+      (when (null lines)
+        ;; End of script — EOF terminates any pending statement, even
+        ;; without a trailing delimiter (à la the MySQL CLI, which flushes
+        ;; its input buffer at EOF rather than requiring a final `;').
+        (let ((trimmed (string-trim pending)))
+          (when (and (> (length trimmed) 0) (buffer-live-p buf))
+            (with-current-buffer buf
+              (when (isqlm--cond-active-p)
+                (if (and (not (string-match-p "\n" trimmed))
+                         (string-prefix-p "\\" trimmed))
+                    ;; A dangling built-in command line.
+                    (isqlm--execute-line pending (lambda () nil))
+                  ;; Treat the remainder as a complete SQL statement.
+                  (isqlm--async-run-statements
+                   (isqlm--split-statements pending) buf
+                   (lambda () nil)))))))
+        (throw 'isqlm--script-done nil))
+      (unless (buffer-live-p buf)
+        (throw 'isqlm--script-done nil))
+      (let* ((line (car lines))
+             (rest (cdr lines))
+             (line-trimmed (string-trim line)))
         (with-current-buffer buf
           ;; DELIMITER directive — must appear on its own line, no pending SQL
           (let ((new-delim (and (string= (string-trim pending) "")
@@ -1982,7 +2000,7 @@ Recognizes DELIMITER directives (MySQL CLI compatible)."
             (if new-delim
                 (progn
                   (setq isqlm-delimiter new-delim)
-                  (isqlm--script-process-lines rest "" buf))
+                  (setq lines rest pending ""))
               ;; Normal processing
               (let* ((new-pending (concat pending
                                          (if (string= pending "") "" "\n")
@@ -1996,28 +2014,30 @@ Recognizes DELIMITER directives (MySQL CLI compatible)."
                    ;; Conditional flow commands — always process, then continue
                    ((isqlm--cond-flow-command-p trimmed)
                     (isqlm--process-cond-flow trimmed)
-                    (isqlm--script-process-lines rest "" buf))
+                    (setq lines rest pending ""))
                    ;; Other commands — only when active (async via callback)
                    ((isqlm--cond-active-p)
                     (isqlm--execute-line
                      new-pending
                      (lambda ()
-                       (isqlm--script-process-lines rest "" buf))))
+                       (isqlm--script-process-lines rest "" buf)))
+                    (throw 'isqlm--script-done nil))
                    ;; Inactive — skip command, continue
                    (t
-                    (isqlm--script-process-lines rest "" buf))))
+                    (setq lines rest pending ""))))
                  ;; Complete SQL — execute only when active
                  ((isqlm--sql-complete-p new-pending)
                   (if (isqlm--cond-active-p)
-                      (let ((statements (isqlm--split-statements new-pending)))
+                      (progn
                         (isqlm--async-run-statements
-                         statements buf
+                         (isqlm--split-statements new-pending) buf
                          (lambda ()
-                           (isqlm--script-process-lines rest "" buf))))
-                    (isqlm--script-process-lines rest "" buf)))
-                 ;; Incomplete — accumulate and continue
+                           (isqlm--script-process-lines rest "" buf)))
+                        (throw 'isqlm--script-done nil))
+                    (setq lines rest pending "")))
+                 ;; Incomplete — accumulate and continue (loop, no recursion)
                  (t
-                  (isqlm--script-process-lines rest new-pending buf)))))))))))
+                  (setq lines rest pending new-pending)))))))))))
 
 
 ;; Minor mode for \i - editing buffer
